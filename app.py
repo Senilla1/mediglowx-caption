@@ -1,34 +1,17 @@
-from fastapi import FastAPI, File, UploadFile
-from fastapi.middleware.cors import CORSMiddleware
-from transformers import BlipProcessor, BlipForConditionalGeneration
-from PIL import Image
-import torch
-import io
+from flask import Flask, request, jsonify
+import os
 
-app = FastAPI()
+app = Flask(__name__)
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+@app.route("/", methods=["GET"])
+def home():
+    return jsonify({"message": "MediGlowX Caption AI is live!"})
 
-device = "cuda" if torch.cuda.is_available() else "cpu"
-processor = BlipProcessor.from_pretrained("Salesforce/blip-image-captioning-base")
-model = BlipForConditionalGeneration.from_pretrained("Salesforce/blip-image-captioning-base").to(device)
+@app.route("/caption", methods=["POST"])
+def caption():
+    # Placeholder működéshez, amíg az AI-modul nincs készre kapcsolva
+    return jsonify({"caption": "Ez egy teszt képaláírás a MediGlowX rendszerből."})
 
-@app.get("/")
-async def root():
-    return {"message": "BLIP Captioning API is running."}
-
-@app.post("/predict")
-async def predict(image: UploadFile = File(...)):
-    contents = await image.read()
-    raw_image = Image.open(io.BytesIO(contents)).convert('RGB')
-
-    inputs = processor(raw_image, return_tensors="pt").to(device)
-    out = model.generate(**inputs)
-    caption = processor.decode(out[0], skip_special_tokens=True)
-
-    return {"caption": caption}
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
