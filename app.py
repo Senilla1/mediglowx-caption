@@ -1,17 +1,38 @@
 from flask import Flask, request, jsonify
-import os
+import requests
 
 app = Flask(__name__)
 
-@app.route("/", methods=["GET"])
-def home():
-    return jsonify({"message": "MediGlowX Caption AI is live!"})
+# Hugging Face modell URL
+HF_URL = "https://senilla-mediglowx-caption.hf.space/run/predict"
 
 @app.route("/caption", methods=["POST"])
 def caption():
-    # Placeholder működéshez, amíg az AI-modul nincs készre kapcsolva
-    return jsonify({"caption": "Ez egy teszt képaláírás a MediGlowX rendszerből."})
+    try:
+        # Érkező JSON adatok
+        data = request.get_json()
+
+        # Kép URL kinyerése a JSON-ből
+        image_url = data["data"][0] if "data" in data and isinstance(data["data"], list) else None
+        if not image_url:
+            return jsonify({"error": "Nincs érvényes kép URL"}), 400
+
+        # API kérés összeállítása Hugging Face modellhez
+        payload = {
+            "data": [image_url]
+        }
+
+        # Küldés a Hugging Face modellnek
+        response = requests.post(HF_URL, json=payload)
+        response.raise_for_status()
+
+        result = response.json()
+        caption = result.get("data", ["Nem sikerült képaláírást generálni."])[0]
+
+        return jsonify({"caption": caption})
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+    app.run(debug=True)
