@@ -1,38 +1,31 @@
 from flask import Flask, request, jsonify
+from transformers import BlipProcessor, BlipForConditionalGeneration
+from PIL import Image
 import requests
+import torch
 
 app = Flask(__name__)
 
-# Hugging Face modell URL
-HF_URL = "https://senilla-mediglowx-caption.hf.space/run/predict"
+processor = BlipProcessor.from_pretrained("Salesforce/blip-image-captioning-base")
+model = BlipForConditionalGeneration.from_pretrained("Salesforce/blip-image-captioning-base")
 
 @app.route("/caption", methods=["POST"])
 def caption():
     try:
-        # Érkező JSON adatok
         data = request.get_json()
-
-        # Kép URL kinyerése a JSON-ből
-        image_url = data["data"][0] if "data" in data and isinstance(data["data"], list) else None
+        image_url = data.get("image_url")
         if not image_url:
-            return jsonify({"error": "Nincs érvényes kép URL"}), 400
+            return jsonify({"error": "No image URL provided"}), 400
+        
+        raw_image = Image.open(requests.get(image_url, stream=True).raw).convert('RGB')
 
-        # API kérés összeállítása Hugging Face modellhez
-        payload = {
-            "data": [image_url]
-        }
-
-        # Küldés a Hugging Face modellnek
-        response = requests.post(HF_URL, json=payload)
-        response.raise_for_status()
-
-        result = response.json()
-        caption = result.get("data", ["Nem sikerült képaláírást generálni."])[0]
+        inputs = processor(raw_image, return_tensors="pt")
+        out = model.generate(**inputs)
+        caption = processor.decode(out[0], skip_special_tokens=True)
 
         return jsonify({"caption": caption})
-
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 if __name__ == "__main__":
-    app.run(debug=True)
+    app.run(host='0.0.0.0', port=5000)
