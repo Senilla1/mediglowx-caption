@@ -15,14 +15,13 @@ model = BlipForConditionalGeneration.from_pretrained("Salesforce/blip-image-capt
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 model.to(device)
 
-
 @app.route("/caption", methods=["POST"])
 def generate_caption():
     data = request.get_json()
-    
+
     if not data or "image" not in data:
         return jsonify({"error": "Missing 'image' URL in request"}), 400
-    
+
     image_url = data["image"]
 
     try:
@@ -34,17 +33,24 @@ def generate_caption():
 
     try:
         inputs = processor(images=image, return_tensors="pt").to(device)
-        output = model.generate(**inputs)
+
+        # 👉 Prompt for detailed skin analysis
+        prompt = ("Describe the person’s skin condition in detail, focusing on skin tone, texture, "
+                  "fine lines, wrinkles, dark spots, redness, irritation, acne, puffiness, under-eye bags, "
+                  "sagging skin, oily areas, and dry or flaky patches.")
+
+        input_ids = processor(text=prompt, return_tensors="pt").input_ids.to(device)
+        output = model.generate(**inputs, input_ids=input_ids, max_length=100)
+
         caption = processor.decode(output[0], skip_special_tokens=True)
+
         return jsonify({"caption": caption})
     except Exception as e:
         return jsonify({"error": f"Failed to generate caption: {str(e)}"}), 500
 
-
 @app.route("/", methods=["GET"])
 def home():
     return "Captioning service is running."
-
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
