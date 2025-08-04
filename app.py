@@ -6,7 +6,7 @@ from transformers import BlipProcessor, BlipForConditionalGeneration
 
 app = Flask(__name__)
 
-# Load model and processor
+# Load processor and model
 processor = BlipProcessor.from_pretrained("Salesforce/blip-image-captioning-base")
 model = BlipForConditionalGeneration.from_pretrained("Salesforce/blip-image-captioning-base")
 
@@ -17,35 +17,30 @@ def home():
 @app.route("/caption", methods=["POST"])
 def caption():
     try:
-        # Parse JSON input
+        # Get JSON and extract image URL
         data = request.get_json()
         if not data or "image_url" not in data:
             return jsonify({"error": "Missing 'image_url' in request body"}), 400
-
+        
         image_url = data["image_url"]
 
-        # Download image
+        # Download the image
         response = requests.get(image_url)
-        if response.status_code != 200:
-            return jsonify({"error": f"Failed to download image, status code: {response.status_code}"}), 400
+        response.raise_for_status()  # Raise error for non-200 responses
 
-        # Open image
-        try:
-            image = Image.open(BytesIO(response.content)).convert("RGB")
-        except Exception as e:
-            return jsonify({"error": f"Invalid image file: {str(e)}"}), 400
+        image = Image.open(BytesIO(response.content)).convert("RGB")
 
-        # Preprocess image
+        # Preprocess and generate caption
         inputs = processor(images=image, return_tensors="pt", padding=True)
-
-        # Generate caption
         out = model.generate(**inputs)
         caption = processor.decode(out[0], skip_special_tokens=True)
 
         return jsonify({"caption": caption})
 
+    except requests.exceptions.RequestException as req_err:
+        return jsonify({"error": f"Image download failed: {str(req_err)}"}), 400
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return jsonify({"error": f"Internal server error: {str(e)}"}), 500
 
 if __name__ == "__main__":
     app.run(debug=True)
