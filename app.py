@@ -26,7 +26,14 @@ def caption():
 
         # Download image
         response = requests.get(image_url)
-        image = Image.open(BytesIO(response.content)).convert('RGB')
+        if response.status_code != 200:
+            return jsonify({"error": f"Failed to download image, status code: {response.status_code}"}), 400
+
+        # Open image
+        try:
+            image = Image.open(BytesIO(response.content)).convert("RGB")
+        except Exception as e:
+            return jsonify({"error": f"Invalid image file: {str(e)}"}), 400
 
         # Preprocess image
         inputs = processor(images=image, return_tensors="pt", padding=True)
