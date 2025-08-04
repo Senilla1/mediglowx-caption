@@ -1,25 +1,28 @@
 from flask import Flask, request, jsonify
 from PIL import Image
 import requests
-from transformers import BlipProcessor, BlipForConditionalGeneration
-import torch
 from io import BytesIO
+from transformers import BlipProcessor, BlipForConditionalGeneration
 
 app = Flask(__name__)
 
-# Load processor and model once when the server starts
+# Load model and processor
 processor = BlipProcessor.from_pretrained("Salesforce/blip-image-captioning-base")
 model = BlipForConditionalGeneration.from_pretrained("Salesforce/blip-image-captioning-base")
+
+@app.route("/")
+def home():
+    return "BLIP Caption API running!"
 
 @app.route("/caption", methods=["POST"])
 def caption():
     try:
         # Parse JSON input
         data = request.get_json()
-        image_url = data.get("image_url")
+        if not data or "image_url" not in data:
+            return jsonify({"error": "Missing 'image_url' in request body"}), 400
 
-        if not image_url:
-            return jsonify({"error": "Missing image_url"}), 400
+        image_url = data["image_url"]
 
         # Download image
         response = requests.get(image_url)
