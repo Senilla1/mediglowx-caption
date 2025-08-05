@@ -2,21 +2,23 @@ from flask import Flask, request, jsonify
 import requests
 from PIL import Image
 from io import BytesIO
-from transformers import BlipProcessor, BlipForConditionalGeneration
+from transformers import BlipProcessor, BlipForQuestionAnswering
 import torch
 import os
 
 app = Flask(__name__)
 
-processor = BlipProcessor.from_pretrained("Salesforce/blip-image-captioning-base")
-model = BlipForConditionalGeneration.from_pretrained("Salesforce/blip-image-captioning-base")
+# Use the instruction-following BLIP model
+processor = BlipProcessor.from_pretrained("Salesforce/blip-vqa-base")
+model = BlipForQuestionAnswering.from_pretrained("Salesforce/blip-vqa-base")
+
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 model.to(device)
 
 @app.route("/caption", methods=["POST"])
 def generate_caption():
     data = request.get_json()
-    
+
     if not data or "image" not in data:
         return jsonify({"error": "Missing 'image' URL in request"}), 400
 
@@ -29,7 +31,9 @@ def generate_caption():
     except Exception as e:
         return jsonify({"error": f"Failed to load image from URL ({str(e)})"}), 400
 
-    prompt = "What skin problems are visible?"  # ✅ Rövid, működő kérdés
+    # 🧠 Prompt a konkrét bőrproblémákra
+    prompt = "What skin problems are visible?"
+
     try:
         inputs = processor(images=image, text=prompt, return_tensors="pt").to(device)
         output = model.generate(**inputs, max_length=100)
