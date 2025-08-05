@@ -3,7 +3,6 @@ import requests
 from PIL import Image
 from io import BytesIO
 import torch
-import os
 
 from transformers import BlipProcessor, BlipForConditionalGeneration
 
@@ -12,6 +11,7 @@ app = Flask(__name__)
 # Load the model and processor
 processor = BlipProcessor.from_pretrained("Salesforce/blip-image-captioning-base")
 model = BlipForConditionalGeneration.from_pretrained("Salesforce/blip-image-captioning-base")
+
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 model.to(device)
 
@@ -32,16 +32,14 @@ def generate_caption():
         return jsonify({"error": f"Failed to load image from URL: {str(e)}"}), 400
 
     try:
-        inputs = processor(images=image, return_tensors="pt").to(device)
+        # Prompt for detailed skin analysis
+        prompt = (
+            "Describe the person’s skin condition in detail, focusing on skin tone, texture, fine lines, wrinkles, "
+            "dark spots, redness, irritation, acne, puffiness, under-eye bags, sagging skin, oily areas, and dry or flaky patches."
+        )
 
-        # 👉 Prompt for detailed skin analysis
-        prompt = ("Describe the person’s skin condition in detail, focusing on skin tone, texture, "
-                  "fine lines, wrinkles, dark spots, redness, irritation, acne, puffiness, under-eye bags, "
-                  "sagging skin, oily areas, and dry or flaky patches.")
-
-        input_ids = processor(text=prompt, return_tensors="pt").input_ids.to(device)
-        output = model.generate(**inputs, input_ids=input_ids, max_length=100)
-
+        inputs = processor(images=image, text=prompt, return_tensors="pt").to(device)
+        output = model.generate(**inputs, max_length=256)
         caption = processor.decode(output[0], skip_special_tokens=True)
 
         return jsonify({"caption": caption})
@@ -53,5 +51,6 @@ def home():
     return "Captioning service is running."
 
 if __name__ == "__main__":
+    import os
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
