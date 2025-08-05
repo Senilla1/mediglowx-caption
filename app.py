@@ -2,8 +2,9 @@ from flask import Flask, request, jsonify
 import requests
 from PIL import Image
 from io import BytesIO
-import torch
 from transformers import BlipProcessor, BlipForConditionalGeneration
+import torch
+import os
 
 app = Flask(__name__)
 
@@ -15,7 +16,7 @@ model.to(device)
 @app.route("/caption", methods=["POST"])
 def generate_caption():
     data = request.get_json()
-
+    
     if not data or "image" not in data:
         return jsonify({"error": "Missing 'image' URL in request"}), 400
 
@@ -28,21 +29,15 @@ def generate_caption():
     except Exception as e:
         return jsonify({"error": f"Failed to load image from URL ({str(e)})"}), 400
 
-    prompt = (
-        "Describe the person's skin condition in detail based on the image, "
-        "focusing on visible signs such as: wrinkles, fine lines, redness, acne, texture, "
-        "sagging, dryness, under-eye bags, and uneven skin tone."
-    )
-
+    prompt = "What skin problems are visible?"  # ✅ Rövid, működő kérdés
     try:
         inputs = processor(images=image, text=prompt, return_tensors="pt").to(device)
         output = model.generate(**inputs, max_length=100)
-        caption = processor.batch_decode(output, skip_special_tokens=True)[0]
+        caption = processor.decode(output[0], skip_special_tokens=True)
         return jsonify({"caption": caption})
     except Exception as e:
         return jsonify({"error": f"Failed to generate caption ({str(e)})"}), 500
 
 if __name__ == "__main__":
-    import os
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
