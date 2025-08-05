@@ -29,8 +29,9 @@ def generate_caption():
         return jsonify({"error": f"Failed to load image from URL ({str(e)})"}), 400
 
     prompt = (
-        "Describe the person's skin condition in detail based on the image, focusing on visible signs such as: "
-        "wrinkles, fine lines, redness, acne, texture, sagging, dryness, under-eye bags, and uneven skin tone."
+        "Describe the person's skin condition in detail based on the image, "
+        "focusing on visible signs such as: wrinkles, fine lines, redness, acne, texture, "
+        "sagging, dryness, under-eye bags, and uneven skin tone."
     )
 
     try:
