@@ -23,7 +23,7 @@ def caption_image():
         if not image_url:
             return jsonify({"error": "No image_url provided"}), 400
 
-        image = Image.open(BytesIO(requests.get(image_url).content)).convert('RGB')
+        image = Image.open(BytesIO(requests.get(image_url).content)).convert("RGB")
         inputs = processor(images=image, return_tensors="pt").to(device)
 
         out = model.generate(**inputs)
@@ -33,5 +33,6 @@ def caption_image():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-if __name__ == '__main__':
-    app.run()
+if __name__ == "__main__":
+    # Render uses 0.0.0.0 and fixed ports internally
+    app.run(host="0.0.0.0", port=10000)
