@@ -7,9 +7,9 @@ from io import BytesIO
 
 app = Flask(__name__)
 
-# Load model
-processor = BlipProcessor.from_pretrained("Salesforce/blip-image-captioning-base")
-model = BlipForConditionalGeneration.from_pretrained("Salesforce/blip-image-captioning-base")
+# ✅ ÚJ MODELL BETÖLTÉSE – "large" verzió
+processor = BlipProcessor.from_pretrained("Salesforce/blip-image-captioning-large")
+model = BlipForConditionalGeneration.from_pretrained("Salesforce/blip-image-captioning-large")
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 model.to(device)
@@ -30,9 +30,9 @@ def caption_image():
         caption = processor.decode(out[0], skip_special_tokens=True)
 
         return jsonify({"caption": caption})
+
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-if __name__ == "__main__":
-    # Render uses 0.0.0.0 and fixed ports internally
-    app.run(host="0.0.0.0", port=10000)
+if __name__ == '__main__':
+    app.run()
