@@ -1,93 +1,97 @@
-# app.py  — BLIP (helyi, gyors) változat
+# app.py
 import os
-import io
 import time
-from typing import Optional
+from io import BytesIO
 
 import httpx
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, HttpUrl
 from PIL import Image
 
-from transformers import pipeline
+import torch
+from transformers import BlipProcessor, BlipForConditionalGeneration
 
-APP_STARTED_AT = time.time()
-MODEL_NAME = os.getenv("MODEL_NAME", "Salesforce/blip-image-captioning-large")  # << BLIP
-MODEL_STATE = {"pipe": None, "ready_at": None}
+APP_START_TS = time.time()
 
-app = FastAPI(title="MediGlowX BLIP Caption API", version="1.0.0")
+# ---------- FastAPI ----------
+app = FastAPI(title="MediGlowX BLIP-1 Caption API", version="1.0.0")
 
-
-# ----- Model betöltés induláskor ------------------------------------------------
-def load_model():
-    # image-to-text pipeline BLIP-pel (CPU-n is gyors)
-    pipe = pipeline(
-        task="image-to-text",
-        model=MODEL_NAME,
-        device_map="auto"  # CPU-n is OK
-    )
-    MODEL_STATE["pipe"] = pipe
-    MODEL_STATE["ready_at"] = time.time()
-
-
-@app.on_event("startup")
-def _startup():
-    load_model()
-
-
-# ----- Sémák -------------------------------------------------------------------
+# ---------- Request/Response schemas ----------
 class CaptionRequest(BaseModel):
     id: str
-    image: HttpUrl  # Cloudinary secure_url erősen ajánlott
-
+    image: HttpUrl
 
 class CaptionResponse(BaseModel):
     id: str
     caption: str
     model_ready_at: float
 
+# ---------- Model load at startup (no device_map!) ----------
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+MODEL_NAME = os.environ.get("BLIP_MODEL", "Salesforce/blip-image-captioning-large")
 
-# ----- Segédfüggvények ---------------------------------------------------------
+processor: BlipProcessor | None = None
+model: BlipForConditionalGeneration | None = None
+MODEL_READY_AT = 0.0
+
+def load_model():
+    global processor, model, MODEL_READY_AT
+    processor = BlipProcessor.from_pretrained(MODEL_NAME)
+    model = BlipForConditionalGeneration.from_pretrained(MODEL_NAME)
+    model.eval().to(DEVICE)
+    # Warm-up with a tiny black image so the first real call is faster
+    img = Image.new("RGB", (32, 32), (0, 0, 0))
+    inputs = processor(images=img, return_tensors="pt").to(DEVICE)
+    with torch.no_grad():
+        _ = model.generate(**inputs, max_new_tokens=5)
+    MODEL_READY_AT = time.time()
+
+load_model()  # <-- betöltjük induláskor
+
+# ---------- Helpers ----------
+HTTP_TIMEOUT = httpx.Timeout(connect=10.0, read=60.0, write=10.0, pool=10.0)
+
 async def fetch_image(url: str) -> Image.Image:
-    # TIPP: Cloudinary-n kérd kicsiben: .../upload/w_768/...
-    async with httpx.AsyncClient(timeout=60) as client:
+    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT, follow_redirects=True) as client:
         r = await client.get(url)
         if r.status_code != 200:
-            raise HTTPException(status_code=400, detail=f"Image download failed: {r.status_code}")
-        img_bytes = io.BytesIO(r.content)
-    img = Image.open(img_bytes).convert("RGB")
-    return img
+            raise HTTPException(status_code=400, detail=f"Failed to download image: {r.status_code}")
+        try:
+            return Image.open(BytesIO(r.content)).convert("RGB")
+        except Exception as e:
+            raise HTTPException(status_code=422, detail=f"Invalid image file: {e}")
 
-
-def generate_caption(pil_image: Image.Image) -> str:
-    pipe = MODEL_STATE["pipe"]
-    out = pipe(pil_image, max_new_tokens=60)
-    # BLIP output formátuma: [{'generated_text': '...'}]
-    text = (out[0].get("generated_text") or "").strip()
-    return text
-
-
-# ----- Endpontok ---------------------------------------------------------------
+# ---------- Endpoints ----------
 @app.get("/health")
-def health():
+async def health():
     return {
         "ok": True,
-        "model_loaded": MODEL_STATE["pipe"] is not None,
-        "model_ready_at": MODEL_STATE["ready_at"],
+        "model_loaded": model is not None and processor is not None,
+        "model_ready_at": MODEL_READY_AT,
         "ts": time.time(),
     }
 
-
 @app.post("/caption", response_model=CaptionResponse)
 async def caption(body: CaptionRequest):
-    # kép letöltés
+    if model is None or processor is None:
+        raise HTTPException(status_code=503, detail="Model not loaded")
+
     img = await fetch_image(str(body.image))
-    # felirat generálás
-    text = generate_caption(img)
-    if not text:
-        raise HTTPException(status_code=500, detail="Empty caption")
-    return CaptionResponse(
-        id=body.id,
-        caption=text,
-        model_ready_at=MODEL_STATE["ready_at"] or APP_STARTED_AT,
-    )
+
+    # BLIP-1 inference
+    inputs = processor(images=img, return_tensors="pt").to(DEVICE)
+    with torch.no_grad():
+        out_ids = model.generate(
+            **inputs,
+            max_new_tokens=30,   # hosszabb leírás
+            num_beams=3,         # minőség vs. sebesség balansz
+            repetition_penalty=1.1
+        )
+    text = processor.decode(out_ids[0], skip_special_tokens=True).strip()
+
+    return CaptionResponse(id=body.id, caption=text, model_ready_at=MODEL_READY_AT)
+
+# Local run
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("app:app", host="0.0.0.0", port=int(os.getenv("PORT", 10000)))
