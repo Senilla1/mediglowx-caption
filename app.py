@@ -270,6 +270,46 @@ async def analyze(body: AnalyzeRequest):
 # ------------------------------
 # Local run
 # ------------------------------
+# =========================
+# Receive final result API
+# =========================
+from typing import Optional, List  # (nálad ezek már importálva vannak, ha igen, ezt a sort kihagyhatod)
+from pydantic import BaseModel, HttpUrl  # (ez is valószínűleg megvan felül)
+
+class ReceiveRequest(BaseModel):
+    # Végső delivery-hez szánt kulcsok
+    analysis_id: Optional[str] = None
+    user_id:     Optional[str] = None
+    final_text:  Optional[str] = None
+    image_url:   Optional[HttpUrl] = None
+
+    # Tartalék (ha a Make még a /analyze formátumot küldi ide is)
+    id:         Optional[str] = None
+    image:      Optional[HttpUrl] = None
+    questions:  Optional[List[str]] = None
+
+class ReceiveResponse(BaseModel):
+    ok: bool
+    payload: dict
+
+@app.post("/api/receive", response_model=ReceiveResponse)
+async def receive(req: ReceiveRequest):
+    # Normalizálás: ha a régi mezők jönnek, alakítsuk át
+    analysis_id = req.analysis_id or req.id
+    image_url   = req.image_url or req.image
+
+    payload = {
+        "analysis_id": analysis_id,
+        "user_id": req.user_id,
+        "final_text": req.final_text,
+        "image_url": image_url,
+        "questions": req.questions or [],
+    }
+
+    # Itt tudsz majd menteni DB-be, e‑mailt küldeni, stb.
+    # pl.: save_to_db(payload)  # TODO
+
+    return ReceiveResponse(ok=True, payload=payload)
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("app:app", host="0.0.0.0", port=int(os.getenv("PORT", 10000)))
