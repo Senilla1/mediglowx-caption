@@ -229,59 +229,62 @@ async def caption(body: CaptionRequest):
 
 @app.post("/analyze", response_model=AnalyzeResponse)
 async def analyze(body: AnalyzeRequest):
-    if vqa_model is None or vqa_processor is None:
-        raise HTTPException(status_code=503, detail="VQA model not loaded")
-
-       import time
-    import logging
-    logger = logging.getLogger(__name__)
-
-    t_start = time.time()
+    @app.post("/analyze", response_model=AnalyzeResponse)
+async def analyze(body: AnalyzeRequest):
+    t0 = time.time()
+    logger.info("analyze:start req_id=%s", body.id)
 
     if vqa_model is None or vqa_processor is None:
         raise HTTPException(status_code=503, detail="VQA model not loaded")
 
-    t_before_fetch = time.time()
-    questions = body.questions or DEFAULT_QUESTIONS
-    image = await fetch_image(str(body.image))
-    t_after_fetch = time.time()
-    logger.info(f"/analyze: fetch_image took {t_after_fetch - t_before_fetch:.2f} sec")
+    try:
+        # 1) kép letöltés
+        t1 = time.time()
+        img = await fetch_image(str(body.image))
+        t2 = time.time()
 
-    answers: Dict[str, str] = {}
-    t_before_inference = time.time()
-    with torch.inference_mode():
-        for q in questions:
-            prompt = f"Question: {q} Answer:"
-            inputs = vqa_processor(images=image, text=prompt, return_tensors="pt").to(DEVICE)
-            out_ids = vqa_model.generate(
-                **inputs,
-                max_new_tokens=5,
-                num_beams=3,
-                length_penalty=0.0,
-            )
-            raw = vqa_processor.decode(out_ids[0], skip_special_tokens=True)
-            answers[q] = yes_no_from_text(raw)
-    t_after_inference = time.time()
-    logger.info(f"/analyze: model inference took {t_after_inference - t_before_inference:.2f} sec")
+        # 2) kérdés-válasz inferencia
+        answers: Dict[str, str] = {}
+        with torch.inference_mode():
+            for q in (body.questions or DEFAULT_QUESTIONS):
+                prompt = f"Question: {q} Answer:"
+                inputs = vqa_processor(
+                    images=img, text=prompt, return_tensors="pt"
+                ).to(DEVICE)
+                out = vqa_model.generate(
+                    **inputs,
+                    max_new_tokens=5,
+                    num_beams=3,
+                    length_penalty=0.0,
+                )
+                raw = vqa_processor.decode(out[0], skip_special_tokens=True)
+                answers[q] = yes_no_from_text(raw)
 
-    # Rövid indoklás
-    positives = [k for k, v in answers.items() if v == "yes"]
-    rationale = (
-        "Detected concerns: "
-        + (", ".join(positives) if positives else "none with high confidence")
-    )
-    led_modes = leds_from_flags(answers)
+        t3 = time.time()
 
-    total_time = time.time() - t_start
-    logger.info(f"/analyze: TOTAL processing time = {total_time:.2f} sec")
+        # 3) posztprocessz
+        positives = [k for k, v in answers.items() if v == "yes"]
+        rationale = ", ".join(positives) if positives else "none with high confidence"
+        led_modes = leds_from_flags(answers)
 
-    return AnalyzeResponse(
-        id=body.id,
-        rationale=rationale,
-        led_modes=led_modes,
-        model_ready_at=MODEL_READY_AT
-    )
+        t4 = time.time()
 
+        logger.info(
+            "analyze:timings req_id=%s download=%.3f infer=%.3f post=%.3f total=%.3f flags=%s",
+            body.id, (t2 - t1), (t3 - t2), (t4 - t3), (t4 - t0), answers,
+        )
+
+        return AnalyzeResponse(
+            id=body.id,
+            answers=answers,
+            recommended_led_modes=led_modes,
+            rationale=rationale,
+            model_ready_at=MODEL_READY_AT,
+        )
+
+    except Exception as e:
+        logger.exception("analyze:error req_id=%s err=%s", body.id, e)
+        raise HTTPException(status_code=500, detail=str(e))
 # ------------------------------
 # Local run
 # ------------------------------
