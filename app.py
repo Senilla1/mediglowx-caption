@@ -4,69 +4,94 @@ import time
 from io import BytesIO
 from typing import List, Optional, Dict, Any
 
+import logging
 import httpx
 import torch
 from PIL import Image
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, HttpUrl
-import asyncio
 
+# Transformers
 from transformers import (
     BlipProcessor,
     BlipForConditionalGeneration,
     AutoProcessor,
-    BlipForQuestionAnswering,  # alias of BlipForConditionalGeneration for VQA ckpt
+    BlipForQuestionAnswering,  # alias of BLIP for VQA ckpt
 )
+
+# ------------------------------------------------------------------------------
+# Logging
+# ------------------------------------------------------------------------------
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 APP_START_TS = time.time()
 
-# ------------------------------
+# ------------------------------------------------------------------------------
 # FastAPI
-# ------------------------------
+# ------------------------------------------------------------------------------
 app = FastAPI(title="MediGlowX BLIP API", version="1.0.0")
 
-# ------------------------------
+# ------------------------------------------------------------------------------
 # Schemas
-# ------------------------------
+# ------------------------------------------------------------------------------
 class CaptionRequest(BaseModel):
     id: str
     image: HttpUrl
+
 
 class CaptionResponse(BaseModel):
     id: str
     caption: str
     model_ready_at: float
 
+
 class AnalyzeRequest(BaseModel):
     id: str
     image: HttpUrl
-    questions: Optional[List[str]] = None  # ha None, a default 19 kérdést használjuk
+    questions: Optional[List[str]] = None  # ha None, a default kérdéseket használjuk
+
 
 class AnalyzeResponse(BaseModel):
     id: str
-    answers: Dict[str, str]           # {"Fine lines visible?": "yes/no/unsure"}
-    leds: List[str]                   # ajánlott LED módok
-    rationale: str                    # rövid összefoglaló
+    answers: Dict[str, str]        # "Fine lines visible?" -> "yes/no/unsure"
+    led_modes: List[str]           # ajánlott LED módok
+    rationale: str                 # rövid összefoglaló
     model_ready_at: float
 
-# ------------------------------
+# Opcionális “final result” fogadó endpoint (nálatok már megvolt)
+from typing import Optional as _Optional, List as _List  # csak hogy pydantic ne kavarjon
+
+class ReceiveRequest(BaseModel):
+    analysis_id: _Optional[str] = None
+    user_id: _Optional[str] = None
+    final_text: _Optional[str] = None
+    image_url: _Optional[HttpUrl] = None
+    questions: _Optional[_List[str]] = None
+
+class ReceiveResponse(BaseModel):
+    ok: bool
+    payload: Dict[str, Any]
+
+# ------------------------------------------------------------------------------
 # Model config
-# ------------------------------
+# ------------------------------------------------------------------------------
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-# BLIP-1 caption
-CAPTION_MODEL_NAME = os.environ.get("BLIP_CAPTION_MODEL", "Salesforce/blip-image-captioning-large")
-caption_processor: Optional[BlipProcessor] = None
-caption_model: Optional[BlipForConditionalGeneration] = None
+CAPTION_MODEL_NAME = os.environ.get("BLIP_CAPTION_MODEL", "salesforce/blip-image-captioning-large")
+VQA_MODEL_NAME     = os.environ.get("BLIP_VQA_MODEL",     "salesforce/blip-vqa-base")
 
-# BLIP VQA
-VQA_MODEL_NAME = os.environ.get("BLIP_VQA_MODEL", "Salesforce/blip-vqa-base")
+caption_processor: Optional[BlipProcessor] = None
+caption_model:     Optional[BlipForConditionalGeneration] = None
+
 vqa_processor: Optional[AutoProcessor] = None
-vqa_model: Optional[BlipForQuestionAnswering] = None
+vqa_model:     Optional[BlipForQuestionAnswering] = None
 
 MODEL_READY_AT: float = 0.0
 
-# Default 19 kérdés (a te listád)
+# ------------------------------------------------------------------------------
+# Default  kérdések  (a ti listátok alapján)
+# ------------------------------------------------------------------------------
 DEFAULT_QUESTIONS = [
     "Fine lines visible?",
     "Skin looks dull?",
@@ -89,9 +114,9 @@ DEFAULT_QUESTIONS = [
     "Dry or flaky skin visible?",
 ]
 
-# ------------------------------
-# Load models at startup (with warm‑up)
-# ------------------------------
+# ------------------------------------------------------------------------------
+# Load models at startup (with warm-up)
+# ------------------------------------------------------------------------------
 def load_models() -> None:
     global caption_processor, caption_model, vqa_processor, vqa_model, MODEL_READY_AT
 
@@ -105,7 +130,7 @@ def load_models() -> None:
     vqa_model = BlipForQuestionAnswering.from_pretrained(VQA_MODEL_NAME)
     vqa_model.to(DEVICE)
 
-    # Warm-up (1 tiny 32x32 fekete kép, hogy a first-call ne legyen hideg)
+    # ~1 tiny 32x32 fekete kép warmuphoz
     img = Image.new("RGB", (32, 32), (0, 0, 0))
 
     with torch.inference_mode():
@@ -121,19 +146,20 @@ def load_models() -> None:
 
 load_models()
 
-# ------------------------------
+# ------------------------------------------------------------------------------
 # Helpers
-# ------------------------------
+# ------------------------------------------------------------------------------
 HTTP_TIMEOUT = httpx.Timeout(connect=5.0, read=30.0, write=10.0, pool=10.0)
+
 async def fetch_image(url: str) -> Image.Image:
     async with httpx.AsyncClient(timeout=HTTP_TIMEOUT, follow_redirects=True) as client:
         r = await client.get(url)
-    if r.status_code != 200:
-        raise HTTPException(status_code=400, detail=f"Failed to download image: {r.status_code}")
-    try:
-        return Image.open(BytesIO(r.content)).convert("RGB")
-    except Exception as e:
-        raise HTTPException(status_code=422, detail=f"Invalid image file: {e}")
+        if r.status_code != 200:
+            raise HTTPException(status_code=400, detail=f"Failed to download image: {r.status_code}")
+        try:
+            return Image.open(BytesIO(r.content)).convert("RGB")
+        except Exception as e:
+            raise HTTPException(status_code=422, detail=f"Invalid image file: {e}")
 
 def yes_no_from_text(txt: str) -> str:
     """
@@ -151,11 +177,12 @@ def yes_no_from_text(txt: str) -> str:
 
 def leds_from_flags(flags: Dict[str, str]) -> List[str]:
     """
-    Egyszerű backend‑szabályok az ajánláshoz (később bővíthető).
+    Egyszerű backend-szabályok az ajánláshoz – sorrendtartással és deduplikálással.
+    A flags kulcsai a kérdések, értékei "yes/no/unsure".
     """
-    Y = lambda k: flags.get(k, "no") == "yes"
-
+    Y = lambda k: (flags.get(k, "no") == "yes")
     leds: List[str] = []
+
     # Blue
     if Y("Acne or pimples visible?") or Y("Clogged pores visible?") or Y("Skin looks oily?"):
         leds.append("Blue 465 nm")
@@ -166,7 +193,7 @@ def leds_from_flags(flags: Dict[str, str]) -> List[str]:
 
     # Red+NIR
     if Y("Deep wrinkles visible?") or Y("Skin looks saggy?"):
-        leds.append("Red + Near‑IR 630+850 nm")
+        leds.append("Red + Near-IR 630+850 nm")
 
     # Green
     if Y("Redness visible?") or Y("Skin discoloration visible?") or Y("Pigmentation spots visible?"):
@@ -177,36 +204,37 @@ def leds_from_flags(flags: Dict[str, str]) -> List[str]:
         leds.append("Yellow 590 nm")
 
     # Purple (aging + breakouts/texture)
-    if Y("Aging signs with breakouts?") or (Y("Fine lines visible?") and (Y("Acne or pimples visible?") or Y("Uneven skin texture?"))):
-        leds.append("Purple 630+465 nm")
+    if Y("Aging signs with breakouts?") and (Y("Fine lines visible?") or Y("Acne or pimples visible?") or Y("Uneven skin texture?")):
+        leds.append("Purple 630+405 nm")
 
     # Indigo (vibrancy + calming)
     if Y("Skin looks stressed?") or Y("Multiple mild skin issues visible?"):
         leds.append("Indigo 465+530 nm")
 
     # White (mindenből kicsi)
-    if not leds or Y("Multiple mild skin issues visible?"):
+    if Y("Multiple mild skin issues visible?") or Y("Dry or flaky skin visible?"):
         leds.append("White 630+530+465 nm")
 
     # dedup, sorrend megtartásával
     seen = set()
-    ordered = []
+    ordered: List[str] = []
     for m in leds:
         if m not in seen:
             ordered.append(m)
             seen.add(m)
     return ordered
 
-# ------------------------------
+# ------------------------------------------------------------------------------
 # Endpoints
-# ------------------------------
+# ------------------------------------------------------------------------------
+
 @app.get("/health")
 def health() -> Dict[str, Any]:
     return {
         "ok": True,
-        "model_loaded": all([caption_model, caption_processor, vqa_model, vqa_processor]) is not None,
+        "model_loaded": all(x is not None for x in [caption_model, caption_processor, vqa_model, vqa_processor]),
         "model_ready_at": MODEL_READY_AT,
-        "ts": time.time(),
+        "uptime_s": time.time() - APP_START_TS,
     }
 
 @app.post("/caption", response_model=CaptionResponse)
@@ -215,23 +243,22 @@ async def caption(body: CaptionRequest):
         raise HTTPException(status_code=503, detail="Caption model not loaded")
 
     img = await fetch_image(str(body.image))
-    inputs = caption_processor(images=img, return_tensors="pt").to(DEVICE)
     with torch.inference_mode():
-        ids = caption_model.generate(
+        inputs = caption_processor(images=img, return_tensors="pt").to(DEVICE)
+        out_ids = caption_model.generate(
             **inputs,
             max_new_tokens=35,
             num_beams=3,
             repetition_penalty=1.2,
         )
-        txt = caption_processor.decode(ids[0], skip_special_tokens=True).strip()
+        txt = caption_processor.decode(out_ids[0], skip_special_tokens=True).strip()
 
     return CaptionResponse(id=body.id, caption=txt, model_ready_at=MODEL_READY_AT)
 
+# ------------------------  MÉRŐPONTOS /analyze  -------------------------------
+
 @app.post("/analyze", response_model=AnalyzeResponse)
 async def analyze(body: AnalyzeRequest):
-    @app.post("/analyze", response_model=AnalyzeResponse)
-async def analyze(body: AnalyzeRequest):
-    t0 = time.time()
     logger.info("analyze:start req_id=%s", body.id)
 
     if vqa_model is None or vqa_processor is None:
@@ -239,18 +266,18 @@ async def analyze(body: AnalyzeRequest):
 
     try:
         # 1) kép letöltés
-        t1 = time.time()
+        t0 = time.time()
         img = await fetch_image(str(body.image))
-        t2 = time.time()
+        t1 = time.time()
 
         # 2) kérdés-válasz inferencia
         answers: Dict[str, str] = {}
+        qs = body.questions or DEFAULT_QUESTIONS
+
         with torch.inference_mode():
-            for q in (body.questions or DEFAULT_QUESTIONS):
+            for q in qs:
                 prompt = f"Question: {q} Answer:"
-                inputs = vqa_processor(
-                    images=img, text=prompt, return_tensors="pt"
-                ).to(DEVICE)
+                inputs = vqa_processor(images=img, text=prompt, return_tensors="pt").to(DEVICE)
                 out = vqa_model.generate(
                     **inputs,
                     max_new_tokens=5,
@@ -260,24 +287,24 @@ async def analyze(body: AnalyzeRequest):
                 raw = vqa_processor.decode(out[0], skip_special_tokens=True)
                 answers[q] = yes_no_from_text(raw)
 
-        t3 = time.time()
+        t2 = time.time()
 
         # 3) posztprocessz
         positives = [k for k, v in answers.items() if v == "yes"]
         rationale = ", ".join(positives) if positives else "none with high confidence"
         led_modes = leds_from_flags(answers)
 
-        t4 = time.time()
+        t3 = time.time()
 
         logger.info(
             "analyze:timings req_id=%s download=%.3f infer=%.3f post=%.3f total=%.3f flags=%s",
-            body.id, (t2 - t1), (t3 - t2), (t4 - t3), (t4 - t0), answers,
+            body.id, (t1 - t0), (t2 - t1), (t3 - t2), (t3 - t0), answers,
         )
 
         return AnalyzeResponse(
             id=body.id,
             answers=answers,
-            recommended_led_modes=led_modes,
+            led_modes=led_modes,
             rationale=rationale,
             model_ready_at=MODEL_READY_AT,
         )
@@ -285,49 +312,22 @@ async def analyze(body: AnalyzeRequest):
     except Exception as e:
         logger.exception("analyze:error req_id=%s err=%s", body.id, e)
         raise HTTPException(status_code=500, detail=str(e))
-# ------------------------------
-# Local run
-# ------------------------------
-# =========================
-# Receive final result API
-# =========================
-from typing import Optional, List  # (nálad ezek már importálva vannak, ha igen, ezt a sort kihagyhatod)
-from pydantic import BaseModel, HttpUrl  # (ez is valószínűleg megvan felül)
 
-class ReceiveRequest(BaseModel):
-    # Végső delivery-hez szánt kulcsok
-    analysis_id: Optional[str] = None
-    user_id:     Optional[str] = None
-    final_text:  Optional[str] = None
-    image_url:   Optional[HttpUrl] = None
+# ------------------------  “Final result” fogadó -------------------------------
 
-    # Tartalék (ha a Make még a /analyze formátumot küldi ide is)
-    id:         Optional[str] = None
-    image:      Optional[HttpUrl] = None
-    questions:  Optional[List[str]] = None
-
-class ReceiveResponse(BaseModel):
-    ok: bool
-    payload: dict
-
-@app.post("/api/receive", response_model=ReceiveResponse)
+@app.post("/receive", response_model=ReceiveResponse)
 async def receive(req: ReceiveRequest):
-    # Normalizálás: ha a régi mezők jönnek, alakítsuk át
-    analysis_id = req.analysis_id or req.id
-    image_url   = req.image_url or req.image
-
     payload = {
-        "analysis_id": analysis_id,
+        "analysis_id": req.analysis_id,
         "user_id": req.user_id,
         "final_text": req.final_text,
-        "image_url": image_url,
+        "image_url": str(req.image_url) if req.image_url else None,
         "questions": req.questions or [],
     }
-
-    # Itt tudsz majd menteni DB-be, e‑mailt küldeni, stb.
-    # pl.: save_to_db(payload)  # TODO
-
+    # TODO: itt lehet DB-be menteni, e-mailt küldeni stb.
     return ReceiveResponse(ok=True, payload=payload)
+
+# ------------------------  Local run  -----------------------------------------
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("app:app", host="0.0.0.0", port=int(os.getenv("PORT", 10000)))
