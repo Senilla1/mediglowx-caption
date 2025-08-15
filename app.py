@@ -9,6 +9,7 @@ import torch
 from PIL import Image
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, HttpUrl
+import asyncio
 
 from transformers import (
     BlipProcessor,
@@ -123,8 +124,7 @@ load_models()
 # ------------------------------
 # Helpers
 # ------------------------------
-HTTP_TIMEOUT = httpx.Timeout(connect=10.0, read=60.0, write=10.0, pool=10.0)
-
+HTTP_TIMEOUT = httpx.Timeout(connect=5.0, read=30.0, write=10.0, pool=10.0)
 async def fetch_image(url: str) -> Image.Image:
     async with httpx.AsyncClient(timeout=HTTP_TIMEOUT, follow_redirects=True) as client:
         r = await client.get(url)
@@ -232,15 +232,27 @@ async def analyze(body: AnalyzeRequest):
     if vqa_model is None or vqa_processor is None:
         raise HTTPException(status_code=503, detail="VQA model not loaded")
 
+       import time
+    import logging
+    logger = logging.getLogger(__name__)
+
+    t_start = time.time()
+
+    if vqa_model is None or vqa_processor is None:
+        raise HTTPException(status_code=503, detail="VQA model not loaded")
+
+    t_before_fetch = time.time()
     questions = body.questions or DEFAULT_QUESTIONS
-    img = await fetch_image(str(body.image))
+    image = await fetch_image(str(body.image))
+    t_after_fetch = time.time()
+    logger.info(f"/analyze: fetch_image took {t_after_fetch - t_before_fetch:.2f} sec")
 
     answers: Dict[str, str] = {}
+    t_before_inference = time.time()
     with torch.inference_mode():
         for q in questions:
-            # BLIP VQA formátum: "Question: ... Answer:"
             prompt = f"Question: {q} Answer:"
-            inputs = vqa_processor(images=img, text=prompt, return_tensors="pt").to(DEVICE)
+            inputs = vqa_processor(images=image, text=prompt, return_tensors="pt").to(DEVICE)
             out_ids = vqa_model.generate(
                 **inputs,
                 max_new_tokens=5,
@@ -249,22 +261,25 @@ async def analyze(body: AnalyzeRequest):
             )
             raw = vqa_processor.decode(out_ids[0], skip_special_tokens=True)
             answers[q] = yes_no_from_text(raw)
-
-    led_modes = leds_from_flags(answers)
+    t_after_inference = time.time()
+    logger.info(f"/analyze: model inference took {t_after_inference - t_before_inference:.2f} sec")
 
     # Rövid indoklás
     positives = [k for k, v in answers.items() if v == "yes"]
     rationale = (
-        "Detected concerns: " + (", ".join(positives) if positives else "none with high confidence") +
-        ". Recommended LED modes: " + ", ".join(led_modes) + "."
+        "Detected concerns: "
+        + (", ".join(positives) if positives else "none with high confidence")
     )
+    led_modes = leds_from_flags(answers)
+
+    total_time = time.time() - t_start
+    logger.info(f"/analyze: TOTAL processing time = {total_time:.2f} sec")
 
     return AnalyzeResponse(
         id=body.id,
-        answers=answers,
-        leds=led_modes,
         rationale=rationale,
-        model_ready_at=MODEL_READY_AT,
+        led_modes=led_modes,
+        model_ready_at=MODEL_READY_AT
     )
 
 # ------------------------------
