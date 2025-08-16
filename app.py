@@ -331,3 +331,61 @@ async def receive(req: ReceiveRequest):
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("app:app", host="0.0.0.0", port=int(os.getenv("PORT", 10000)))
+# --- CORS engedély a Typedream és a saját domainek felé ---
+try:
+    from fastapi.middleware.cors import CORSMiddleware
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=[
+            "https://skincheck.mediglowx.com",   # Typedream aldomain
+            "https://mediglowx.com",             # fődomain
+            "https://www.mediglowx.com",
+        ],
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+except Exception:
+    pass
+
+# --- Eredmények ideiglenes tárhelye (MVP) ---
+RESULTS: Dict[str, Dict[str, Any]] = {}
+
+# A Make IDE KÜLD: itt tároljuk el az eredményt
+class ReceiveRequest(BaseModel):
+    analysis_id: str       # = Tally responseId (rid)
+    user_email: Optional[str] = None
+    image_url: Optional[HttpUrl] = None
+    final_text: Optional[str] = None
+    leds: Optional[List[str]] = None
+    rationale: Optional[str] = None
+    questions: Optional[List[str]] = None
+
+class ReceiveResponse(BaseModel):
+    ok: bool
+    payload: Dict[str, Any] = {}
+
+@app.post("/receive", response_model=ReceiveResponse)
+async def receive(body: ReceiveRequest):
+    RESULTS[body.analysis_id] = {
+        "rid": body.analysis_id,
+        "email": body.user_email,
+        "image_url": str(body.image_url) if body.image_url else None,
+        "final_text": body.final_text,
+        "leds": body.leds or [],
+        "rationale": body.rationale,
+        "questions": body.questions or [],
+        "ts": time.time(),
+    }
+    return ReceiveResponse(ok=True, payload=RESULTS[body.analysis_id])
+
+# A TYPEDREAM LEKÉR: ezzel húzza be az oldal a tartalmat
+@app.get("/result", response_model=Dict[str, Any])
+async def get_result(rid: str):
+    data = RESULTS.get(rid)
+    return {"ok": bool(data), "rid": rid, "data": data}
+
+
+# --- FONTOS: Lokális futtatás ---
+if __name__ == "__main__":
+    app.run(debug=True)
