@@ -389,3 +389,6 @@ async def get_result(rid: str):
 # --- FONTOS: Lokális futtatás ---
 if __name__ == "__main__":
     app.run(debug=True)
+    @app.get("/healthz")
+def healthz():
+    return {"ok": True}
