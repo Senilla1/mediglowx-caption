@@ -1,4 +1,4 @@
-# app.py
+# app.py — MediGlowX BLIP API (Render proxy + RunPod serverless támogatás)
 import os
 import time
 from io import BytesIO
@@ -8,6 +8,7 @@ import logging
 import httpx
 import torch
 from PIL import Image
+
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, HttpUrl
 
@@ -18,30 +19,22 @@ from transformers import (
     AutoProcessor,
     BlipForQuestionAnswering,  # alias of BLIP for VQA ckpt
 )
-import os
-import json
-import httpx
 
-USE_RUNPOD = os.getenv("USE_RUNPOD", "0") == "1"
-RUNPOD_URL = os.getenv("RUNPOD_URL", "").rstrip("/")  # pl. https://<id>.api.runpod.ai
-RUNPOD_TOKEN = os.getenv("RUNPOD_TOKEN", None)        # ha van auth
-
-# ------------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 # Logging
-# ------------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-
 APP_START_TS = time.time()
 
-# ------------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 # FastAPI
-# ------------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 app = FastAPI(title="MediGlowX BLIP API", version="1.0.0")
 
-# ------------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 # Schemas
-# ------------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 class CaptionRequest(BaseModel):
     id: str
     image: HttpUrl
@@ -61,44 +54,46 @@ class AnalyzeRequest(BaseModel):
 
 class AnalyzeResponse(BaseModel):
     id: str
-    answers: Dict[str, str]        # "Fine lines visible?" -> "yes/no/unsure"
-    led_modes: List[str]           # ajánlott LED módok
-    rationale: str                 # rövid összefoglaló
+    answers: Dict[str, str]                 # pl. {"Fine lines visible?": "yes/no/unsure", ...}
+    led_modes: List[str]                    # ajánlott LED módok
+    rationale: str                          # rövid összefoglaló
     model_ready_at: float
 
-# Opcionális “final result” fogadó endpoint (nálatok már megvolt)
-from typing import Optional as _Optional, List as _List  # csak hogy pydantic ne kavarjon
 
+# Opcionális "final result" fogadó endpointhoz (nálatok már megvolt)
 class ReceiveRequest(BaseModel):
-    analysis_id: _Optional[str] = None
-    user_id: _Optional[str] = None
-    final_text: _Optional[str] = None
-    image_url: _Optional[HttpUrl] = None
-    questions: _Optional[_List[str]] = None
+    analysis_id: Optional[str] = None      # Tally responseID (rid)
+    user_email: Optional[str] = None
+    final_text: Optional[str] = None
+    image_url: Optional[HttpUrl] = None
+    leds: Optional[List[str]] = None
+    questions: Optional[List[str]] = None
+
 
 class ReceiveResponse(BaseModel):
     ok: bool
     payload: Dict[str, Any]
 
-# ------------------------------------------------------------------------------
+
+# -----------------------------------------------------------------------------
 # Model config
-# ------------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 CAPTION_MODEL_NAME = os.environ.get("BLIP_CAPTION_MODEL", "salesforce/blip-image-captioning-large")
-VQA_MODEL_NAME     = os.environ.get("BLIP_VQA_MODEL",     "salesforce/blip-vqa-base")
+VQA_MODEL_NAME = os.environ.get("BLIP_VQA_MODEL", "salesforce/blip-vqa-base")
 
 caption_processor: Optional[BlipProcessor] = None
-caption_model:     Optional[BlipForConditionalGeneration] = None
+caption_model: Optional[BlipForConditionalGeneration] = None
 
 vqa_processor: Optional[AutoProcessor] = None
-vqa_model:     Optional[BlipForQuestionAnswering] = None
+vqa_model: Optional[BlipForQuestionAnswering] = None
 
 MODEL_READY_AT: float = 0.0
 
-# ------------------------------------------------------------------------------
-# Default  kérdések  (a ti listátok alapján)
-# ------------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# Default kérdések (a ti listátok alapján)
+# -----------------------------------------------------------------------------
 DEFAULT_QUESTIONS = [
     "Fine lines visible?",
     "Skin looks dull?",
@@ -109,85 +104,74 @@ DEFAULT_QUESTIONS = [
     "Acne or pimples visible?",
     "Clogged pores visible?",
     "Skin looks oily?",
-    "Redness visible?",
     "Skin discoloration visible?",
     "Pigmentation spots visible?",
-    "Signs of irritation?",
-    "Facial puffiness visible?",
     "Aging signs with breakouts?",
-    "Uneven skin texture?",
+    "Cheeks skin textured?",
     "Skin looks stressed?",
     "Multiple mild skin issues visible?",
     "Dry or flaky skin visible?",
 ]
 
-# ------------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 # Load models at startup (with warm-up)
-# ------------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 def load_models() -> None:
     global caption_processor, caption_model, vqa_processor, vqa_model, MODEL_READY_AT
 
+    logger.info("Loading BLIP models… device=%s", DEVICE)
+
     # BLIP caption
     caption_processor = BlipProcessor.from_pretrained(CAPTION_MODEL_NAME)
-    caption_model = BlipForConditionalGeneration.from_pretrained(CAPTION_MODEL_NAME)
-    caption_model.to(DEVICE)
+    caption_model = BlipForConditionalGeneration.from_pretrained(CAPTION_MODEL_NAME).to(DEVICE)
 
     # BLIP VQA
     vqa_processor = AutoProcessor.from_pretrained(VQA_MODEL_NAME)
-    vqa_model = BlipForQuestionAnswering.from_pretrained(VQA_MODEL_NAME)
-    vqa_model.to(DEVICE)
+    vqa_model = BlipForQuestionAnswering.from_pretrained(VQA_MODEL_NAME).to(DEVICE)
 
-    # ~1 tiny 32x32 fekete kép warmuphoz
+    # Mini warm-up (32x32 fekete kép)
     img = Image.new("RGB", (32, 32), (0, 0, 0))
-
     with torch.inference_mode():
-        # caption warmup
         cap_inputs = caption_processor(images=img, return_tensors="pt").to(DEVICE)
         _ = caption_model.generate(**cap_inputs, max_new_tokens=5)
 
-        # vqa warmup (triviális kérdés)
         vqa_inputs = vqa_processor(images=img, text="Is anything visible?", return_tensors="pt").to(DEVICE)
         _ = vqa_model.generate(**vqa_inputs, max_new_tokens=3)
 
     MODEL_READY_AT = time.time()
+    logger.info("Models ready at %.3f", MODEL_READY_AT)
 
 load_models()
 
-# ------------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 # Helpers
-# ------------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 HTTP_TIMEOUT = httpx.Timeout(connect=5.0, read=30.0, write=10.0, pool=10.0)
 
 async def fetch_image(url: str) -> Image.Image:
-    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT, follow_redirects=True) as client:
-        r = await client.get(url)
+    try:
+        async with httpx.AsyncClient(timeout=HTTP_TIMEOUT, follow_redirects=True) as client:
+            r = await client.get(url)
         if r.status_code != 200:
             raise HTTPException(status_code=400, detail=f"Failed to download image: {r.status_code}")
-        try:
-            return Image.open(BytesIO(r.content)).convert("RGB")
-        except Exception as e:
-            raise HTTPException(status_code=422, detail=f"Invalid image file: {e}")
+        return Image.open(BytesIO(r.content)).convert("RGB")
+    except Exception as e:
+        raise HTTPException(status_code=422, detail=f"Invalid image file: {e}")
 
 def yes_no_from_text(txt: str) -> str:
-    """
-    BLIP VQA gyakran rövid választ ad. Normalizáljuk yes/no/unsure értékre.
-    """
     t = (txt or "").strip().lower()
-    if any(k in t for k in ["yes", "yeah", "yep", "true"]):
+    if t in ("y", "yes", "true", "yep", "yeah"): 
         return "yes"
-    if any(k in t for k in ["no", "nope", "false"]):
+    if t in ("n", "no", "nope", "false"):
         return "no"
     # gyakori egy szavas alternatívák
-    if t in {"oily", "acne", "redness"}:
+    if t in ("oily", "acne", "redness"):
         return "yes"
     return "unsure"
 
 def leds_from_flags(flags: Dict[str, str]) -> List[str]:
-    """
-    Egyszerű backend-szabályok az ajánláshoz – sorrendtartással és deduplikálással.
-    A flags kulcsai a kérdések, értékei "yes/no/unsure".
-    """
-    Y = lambda k: (flags.get(k, "no") == "yes")
+    """Egyszerű szabályok LED ajánláshoz – sorrendtartással és deduplikálással."""
+    Y = lambda k: flags.get(k, "no") == "yes"
     leds: List[str] = []
 
     # Blue
@@ -200,21 +184,21 @@ def leds_from_flags(flags: Dict[str, str]) -> List[str]:
 
     # Red+NIR
     if Y("Deep wrinkles visible?") or Y("Skin looks saggy?"):
-        leds.append("Red + Near-IR 630+850 nm")
+        leds.append("Near-IR 638-850+ nm")
 
     # Green
-    if Y("Redness visible?") or Y("Skin discoloration visible?") or Y("Pigmentation spots visible?"):
-        leds.append("Green 530 nm")
+    if Y("Pigmentation spots visible?") or Y("Skin discoloration visible?"):
+        leds.append("Green 538 nm")
 
     # Yellow
-    if Y("Skin looks tired?") or Y("Facial puffiness visible?") or Y("Signs of irritation?"):
+    if Y("Aging signs with breakouts?") or Y("Cheeks skin textured?") or Y("Skin looks oily?"):
         leds.append("Yellow 590 nm")
 
     # Purple (aging + breakouts/texture)
-    if Y("Aging signs with breakouts?") and (Y("Fine lines visible?") or Y("Acne or pimples visible?") or Y("Uneven skin texture?")):
-        leds.append("Purple 630+405 nm")
+    if (Y("Aging signs with breakouts?") and Y("Cheeks skin textured?")) or Y("Acne or pimples visible?"):
+        leds.append("Purple 638+405 nm")
 
-    # Indigo (vibrancy + calming)
+    # Indigo (barrier + calming)
     if Y("Skin looks stressed?") or Y("Multiple mild skin issues visible?"):
         leds.append("Indigo 465+530 nm")
 
@@ -231,30 +215,35 @@ def leds_from_flags(flags: Dict[str, str]) -> List[str]:
             seen.add(m)
     return ordered
 
-async def call_runpod_analyze(image_url: str, questions: list[str] | None) -> dict:
+# -----------------------------------------------------------------------------
+# RunPod proxy támogatás (kapcsolóval)
+# -----------------------------------------------------------------------------
+USE_RUNPOD = os.getenv("USE_RUNPOD", "0") == "1"
+RUNPOD_URL = os.getenv("RUNPOD_URL", "").rstrip("/")  # pl. https://<id>.api.runpod.ai
+RUNPOD_TOKEN = os.getenv("RUNPOD_TOKEN", None)        # ha van auth
+
+async def call_runpod_analyze(image_url: str, questions: Optional[List[str]]) -> Dict[str, Any]:
     if not RUNPOD_URL:
         raise HTTPException(status_code=503, detail="RUNPOD_URL is not configured")
 
     url = f"{RUNPOD_URL}/analyze"
-    headers = {}
+    headers: Dict[str, str] = {}
     if RUNPOD_TOKEN:
         headers["Authorization"] = f"Bearer {RUNPOD_TOKEN}"
 
-    payload = {"image_url": image_url}
+    payload: Dict[str, Any] = {"id": "proxy", "image": image_url}
     if questions:
         payload["questions"] = questions
 
-    timeout = httpx.Timeout(connect=5.0, read=30.0, write=10.0, pool=10.0)
-    async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT, follow_redirects=True) as client:
         r = await client.post(url, headers=headers, json=payload)
-        if r.status_code != 200:
-            raise HTTPException(status_code=502, detail=f"RunPod error {r.status_code}: {r.text}")
-        return r.json()
-        
-# ------------------------------------------------------------------------------
-# Endpoints
-# ------------------------------------------------------------------------------
+    if r.status_code != 200:
+        raise HTTPException(status_code=502, detail=f"RunPod error {r.status_code}: {r.text}")
+    return r.json()
 
+# -----------------------------------------------------------------------------
+# Endpoints
+# -----------------------------------------------------------------------------
 @app.get("/health")
 def health() -> Dict[str, Any]:
     return {
@@ -263,6 +252,10 @@ def health() -> Dict[str, Any]:
         "model_ready_at": MODEL_READY_AT,
         "uptime_s": time.time() - APP_START_TS,
     }
+
+@app.get("/healthz")
+def healthz() -> Dict[str, Any]:
+    return {"ok": True}
 
 @app.post("/caption", response_model=CaptionResponse)
 async def caption(body: CaptionRequest):
@@ -278,15 +271,10 @@ async def caption(body: CaptionRequest):
             num_beams=3,
             repetition_penalty=1.2,
         )
-        txt = caption_processor.decode(out_ids[0], skip_special_tokens=True).strip()
-
+    txt = caption_processor.decode(out_ids[0], skip_special_tokens=True).strip()
     return CaptionResponse(id=body.id, caption=txt, model_ready_at=MODEL_READY_AT)
 
-# ------------------------  MÉRŐPONTOS /analyze  -------------------------------
-
 @app.post("/analyze", response_model=AnalyzeResponse)
-async def analyze(body: AnalyzeRequest):
-    @app.post("/analyze", response_model=AnalyzeResponse)
 async def analyze(body: AnalyzeRequest):
     logger.info("analyze:start req_id=%s", body.id)
 
@@ -295,11 +283,15 @@ async def analyze(body: AnalyzeRequest):
         try:
             runpod = await call_runpod_analyze(str(body.image), body.questions or DEFAULT_QUESTIONS)
 
-            answers = {}
-            if "caption" in runpod:
-                answers["General skin state"] = runpod["caption"]
+            answers: Dict[str, str] = {}
+            # ha a RunPod csak captiont ad
+            if isinstance(runpod, dict) and "caption" in runpod:
+                answers["General skin state"] = str(runpod["caption"])
+            # ha a RunPod VQA válaszokat is ad
             if "answers" in runpod and isinstance(runpod["answers"], dict):
-                answers.update(runpod["answers"])
+                # normalizáljuk yes/no/unsure alakra
+                for k, v in runpod["answers"].items():
+                    answers[str(k)] = yes_no_from_text(str(v))
 
             led_modes = leds_from_flags(answers)
             positives = [k for k, v in answers.items() if v == "yes"]
@@ -318,121 +310,59 @@ async def analyze(body: AnalyzeRequest):
             logger.exception("runpod_proxy_error req_id=%s err=%s", body.id, e)
             raise HTTPException(status_code=502, detail=f"RunPod proxy failed: {e}")
 
-    # --- INNENTŐL marad az eredeti kódod ---
-    if vqa_model is None or vqa_processor is None:
-        raise HTTPException(status_code=503, detail="VQA model not loaded")
-    
-    try:
-        ...
-    logger.info("analyze:start req_id=%s", body.id)
-
+    # --- LOKÁLIS (Render gépen futó) BLIP VQA + postprocess — eredeti logika ---
     if vqa_model is None or vqa_processor is None:
         raise HTTPException(status_code=503, detail="VQA model not loaded")
 
-    try:
-        # 1) kép letöltés
-        t0 = time.time()
-        img = await fetch_image(str(body.image))
-        t1 = time.time()
+    t0 = time.time()
+    # 1) Kép letöltés
+    img = await fetch_image(str(body.image))
+    t1 = time.time()
 
-        # 2) kérdés-válasz inferencia
-        answers: Dict[str, str] = {}
-        qs = body.questions or DEFAULT_QUESTIONS
+    # 2) Kérdés–válasz inferencia
+    qs: List[str] = body.questions or DEFAULT_QUESTIONS
+    answers: Dict[str, str] = {}
+    with torch.inference_mode():
+        for q in qs:
+            inputs = vqa_processor(images=img, text=f"Question: {q} Answer:", return_tensors="pt").to(DEVICE)
+            out = vqa_model.generate(
+                **inputs,
+                max_new_tokens=5,
+                num_beams=3,
+                length_penalty=0.0,
+            )
+            raw = vqa_processor.decode(out[0], skip_special_tokens=True)
+            answers[q] = yes_no_from_text(raw)
 
-        with torch.inference_mode():
-            for q in qs:
-                prompt = f"Question: {q} Answer:"
-                inputs = vqa_processor(images=img, text=prompt, return_tensors="pt").to(DEVICE)
-                out = vqa_model.generate(
-                    **inputs,
-                    max_new_tokens=5,
-                    num_beams=3,
-                    length_penalty=0.0,
-                )
-                raw = vqa_processor.decode(out[0], skip_special_tokens=True)
-                answers[q] = yes_no_from_text(raw)
+    t2 = time.time()
 
-        t2 = time.time()
+    # 3) postprocess
+    positives = [k for k, v in answers.items() if v == "yes"]
+    rationale = ", ".join(positives) if positives else "none with high confidence"
+    led_modes = leds_from_flags(answers)
+    t3 = time.time()
 
-        # 3) posztprocessz
-        positives = [k for k, v in answers.items() if v == "yes"]
-        rationale = ", ".join(positives) if positives else "none with high confidence"
-        led_modes = leds_from_flags(answers)
-
-        t3 = time.time()
-
-        logger.info(
-            "analyze:timings req_id=%s download=%.3f infer=%.3f post=%.3f total=%.3f flags=%s",
-            body.id, (t1 - t0), (t2 - t1), (t3 - t2), (t3 - t0), answers,
-        )
-
-        return AnalyzeResponse(
-            id=body.id,
-            answers=answers,
-            led_modes=led_modes,
-            rationale=rationale,
-            model_ready_at=MODEL_READY_AT,
-        )
-
-    except Exception as e:
-        logger.exception("analyze:error req_id=%s err=%s", body.id, e)
-        raise HTTPException(status_code=500, detail=str(e))
-
-# ------------------------  “Final result” fogadó -------------------------------
-
-@app.post("/receive", response_model=ReceiveResponse)
-async def receive(req: ReceiveRequest):
-    payload = {
-        "analysis_id": req.analysis_id,
-        "user_id": req.user_id,
-        "final_text": req.final_text,
-        "image_url": str(req.image_url) if req.image_url else None,
-        "questions": req.questions or [],
-    }
-    # TODO: itt lehet DB-be menteni, e-mailt küldeni stb.
-    return ReceiveResponse(ok=True, payload=payload)
-
-# ------------------------  Local run  -----------------------------------------
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run("app:app", host="0.0.0.0", port=int(os.getenv("PORT", 10000)))
-# --- CORS engedély a Typedream és a saját domainek felé ---
-try:
-    from fastapi.middleware.cors import CORSMiddleware
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=[
-            "https://skincheck.mediglowx.com",   # Typedream aldomain
-            "https://mediglowx.com",             # fődomain
-            "https://www.mediglowx.com",
-        ],
-        allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
+    logger.info(
+        "analyze:timings req_id=%s download=%.3f infer=%.3f post=%.3f total=%.3f flags=%s",
+        body.id, (t1 - t0), (t2 - t1), (t3 - t2), (t3 - t0), answers,
     )
-except Exception:
-    pass
 
-# --- Eredmények ideiglenes tárhelye (MVP) ---
+    return AnalyzeResponse(
+        id=body.id,
+        answers=answers,
+        led_modes=led_modes,
+        rationale=rationale,
+        model_ready_at=MODEL_READY_AT,
+    )
+
+# -----------------------------------------------------------------------------
+# --- Eredmények ideiglenes tárhelye (HWP) ---
+# -----------------------------------------------------------------------------
 RESULTS: Dict[str, Dict[str, Any]] = {}
-
-# A Make IDE KÜLD: itt tároljuk el az eredményt
-class ReceiveRequest(BaseModel):
-    analysis_id: str       # = Tally responseId (rid)
-    user_email: Optional[str] = None
-    image_url: Optional[HttpUrl] = None
-    final_text: Optional[str] = None
-    leds: Optional[List[str]] = None
-    rationale: Optional[str] = None
-    questions: Optional[List[str]] = None
-
-class ReceiveResponse(BaseModel):
-    ok: bool
-    payload: Dict[str, Any] = {}
 
 @app.post("/receive", response_model=ReceiveResponse)
 async def receive(body: ReceiveRequest):
-    RESULTS[body.analysis_id] = {
+    RESULTS[body.analysis_id or ""] = {
         "rid": body.analysis_id,
         "email": body.user_email,
         "image_url": str(body.image_url) if body.image_url else None,
@@ -442,18 +372,36 @@ async def receive(body: ReceiveRequest):
         "questions": body.questions or [],
         "ts": time.time(),
     }
-    return ReceiveResponse(ok=True, payload=RESULTS[body.analysis_id])
+    return ReceiveResponse(ok=True, payload=RESULTS[body.analysis_id or ""])
 
 # A TYPEDREAM LEKÉR: ezzel húzza be az oldal a tartalmat
 @app.get("/result", response_model=Dict[str, Any])
 async def get_result(rid: str):
-    data = RESULTS.get(rid)
+    data = RESULTS.get(rid, {})
     return {"ok": bool(data), "rid": rid, "data": data}
 
+# -----------------------------------------------------------------------------
+# CORS a Typedream és a saját domainekre
+# -----------------------------------------------------------------------------
+try:
+    from fastapi.middleware.cors import CORSMiddleware
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=[
+            "https://skincheck.mediglowx.com",  # Typedream aldomain
+            "https://mediglowx.com",            # fődomain
+            "https://www.mediglowx.com",
+        ],
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+except Exception:
+    pass
 
-# --- FONTOS: Lokális futtatás ---
+# -----------------------------------------------------------------------------
+# Lokális futtatás (dev)
+# -----------------------------------------------------------------------------
 if __name__ == "__main__":
-    app.run(debug=True)
-    @app.get("/healthz")
-def healthz():
-    return {"ok": True}
+    import uvicorn
+    uvicorn.run("app:app", host="0.0.0.0", port=int(os.getenv("PORT", 10000)))
