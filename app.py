@@ -18,6 +18,13 @@ from transformers import (
     AutoProcessor,
     BlipForQuestionAnswering,  # alias of BLIP for VQA ckpt
 )
+import os
+import json
+import httpx
+
+USE_RUNPOD = os.getenv("USE_RUNPOD", "0") == "1"
+RUNPOD_URL = os.getenv("RUNPOD_URL", "").rstrip("/")  # pl. https://<id>.api.runpod.ai
+RUNPOD_TOKEN = os.getenv("RUNPOD_TOKEN", None)        # ha van auth
 
 # ------------------------------------------------------------------------------
 # Logging
@@ -224,6 +231,26 @@ def leds_from_flags(flags: Dict[str, str]) -> List[str]:
             seen.add(m)
     return ordered
 
+async def call_runpod_analyze(image_url: str, questions: list[str] | None) -> dict:
+    if not RUNPOD_URL:
+        raise HTTPException(status_code=503, detail="RUNPOD_URL is not configured")
+
+    url = f"{RUNPOD_URL}/analyze"
+    headers = {}
+    if RUNPOD_TOKEN:
+        headers["Authorization"] = f"Bearer {RUNPOD_TOKEN}"
+
+    payload = {"image_url": image_url}
+    if questions:
+        payload["questions"] = questions
+
+    timeout = httpx.Timeout(connect=5.0, read=30.0, write=10.0, pool=10.0)
+    async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+        r = await client.post(url, headers=headers, json=payload)
+        if r.status_code != 200:
+            raise HTTPException(status_code=502, detail=f"RunPod error {r.status_code}: {r.text}")
+        return r.json()
+        
 # ------------------------------------------------------------------------------
 # Endpoints
 # ------------------------------------------------------------------------------
@@ -259,6 +286,44 @@ async def caption(body: CaptionRequest):
 
 @app.post("/analyze", response_model=AnalyzeResponse)
 async def analyze(body: AnalyzeRequest):
+    @app.post("/analyze", response_model=AnalyzeResponse)
+async def analyze(body: AnalyzeRequest):
+    logger.info("analyze:start req_id=%s", body.id)
+
+    # --- ÚJ: ha USE_RUNPOD=1, továbbítunk a RunPod Serverless BLIP-nek ---
+    if USE_RUNPOD:
+        try:
+            runpod = await call_runpod_analyze(str(body.image), body.questions or DEFAULT_QUESTIONS)
+
+            answers = {}
+            if "caption" in runpod:
+                answers["General skin state"] = runpod["caption"]
+            if "answers" in runpod and isinstance(runpod["answers"], dict):
+                answers.update(runpod["answers"])
+
+            led_modes = leds_from_flags(answers)
+            positives = [k for k, v in answers.items() if v == "yes"]
+            rationale = ", ".join(positives) if positives else "none with high confidence"
+
+            return AnalyzeResponse(
+                id=body.id,
+                answers=answers,
+                led_modes=led_modes,
+                rationale=rationale,
+                model_ready_at=MODEL_READY_AT,
+            )
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.exception("runpod_proxy_error req_id=%s err=%s", body.id, e)
+            raise HTTPException(status_code=502, detail=f"RunPod proxy failed: {e}")
+
+    # --- INNENTŐL marad az eredeti kódod ---
+    if vqa_model is None or vqa_processor is None:
+        raise HTTPException(status_code=503, detail="VQA model not loaded")
+    
+    try:
+        ...
     logger.info("analyze:start req_id=%s", body.id)
 
     if vqa_model is None or vqa_processor is None:
