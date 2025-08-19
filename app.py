@@ -80,8 +80,8 @@ class ReceiveResponse(BaseModel):
 # -----------------------------------------------------------------------------
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-CAPTION_MODEL_NAME = os.environ.get("BLIP_CAPTION_MODEL", "salesforce/blip-image-captioning-large")
-VQA_MODEL_NAME = os.environ.get("BLIP_VQA_MODEL", "salesforce/blip-vqa-base")
+CAPTION_MODEL_NAME = os.environ.get("BLIP_CAPTION_MODEL", "Salesforce/blip-image-captioning-large")
+VQA_MODEL_NAME = os.environ.get("BLIP_VQA_MODEL", "Salesforce/blip-vqa-base")
 
 caption_processor: Optional[BlipProcessor] = None
 caption_model: Optional[BlipForConditionalGeneration] = None
