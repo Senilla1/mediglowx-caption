@@ -241,6 +241,18 @@ async def call_runpod_analyze(image_url: str, questions: Optional[List[str]]) ->
         raise HTTPException(status_code=502, detail=f"RunPod error {r.status_code}: {r.text}")
     return r.json()
 
+# --- minimal health endpoints for RunPod LB ---
+@app.get("/")
+def root():
+    return {"ok": True}
+
+@app.get("/ping")
+def ping():
+    return {"ok": True}
+
+@app.get("/health")
+def health():
+    return {"ok": True}
 # -----------------------------------------------------------------------------
 # Endpoints
 # -----------------------------------------------------------------------------
