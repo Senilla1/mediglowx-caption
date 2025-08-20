@@ -8,3 +8,4 @@ accelerate==0.33.0
 sentencepiece==0.2.0
 timm==0.9.16
 huggingface_hub>=0.24.0
+hf_transfer
