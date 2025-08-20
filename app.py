@@ -80,8 +80,8 @@ class ReceiveResponse(BaseModel):
 # -----------------------------------------------------------------------------
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-CAPTION_MODEL_NAME = os.environ.get("BLIP_CAPTION_MODEL", "Salesforce/blip-image-captioning-large")
-VQA_MODEL_NAME = os.environ.get("BLIP_VQA_MODEL", "Salesforce/blip-vqa-base")
+CAPTION_MODEL_NAME = "Salesforce/blip-image-captioning-large"
+VQA_MODEL_NAME     = "Salesforce/blip-vqa-base"
 
 caption_processor: Optional[BlipProcessor] = None
 caption_model: Optional[BlipForConditionalGeneration] = None
@@ -119,10 +119,13 @@ DEFAULT_QUESTIONS = [
 def load_models() -> None:
     global caption_processor, caption_model, vqa_processor, vqa_model, MODEL_READY_AT
 
-    logger.info("Loading BLIP models… device=%s", DEVICE)
+    logger.info("CAPTION_MODEL_NAME = %s", CAPTION_MODEL_NAME)
+    logger.info("VQA_MODEL_NAME = %s", VQA_MODEL_NAME)
+    logger.info("Loading BLIP models.. device=%s", DEVICE)
 
     # BLIP caption
-    caption_processor = BlipProcessor.from_pretrained(CAPTION_MODEL_NAME)
+    from transformers import AutoProcessor
+    caption_processor = AutoProcessor.from_pretrained(CAPTION_MODEL_NAME)    
     caption_model = BlipForConditionalGeneration.from_pretrained(CAPTION_MODEL_NAME).to(DEVICE)
 
     # BLIP VQA
