@@ -1,60 +1,76 @@
 # worker.py
-import os, io, logging
-from typing import Optional
-import httpx
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, HttpUrl
+import time, os
+from typing import Dict, Any, Optional, List
+import runpod
 from PIL import Image
-import torch
-from transformers import BlipForConditionalGeneration, BlipProcessor
+import httpx
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
-log = logging.getLogger("worker")
+# Újrahasznosítjuk az app.py modelljeit/függvényeit
+from app import (
+    load_models, caption_processor, caption_model,
+    vqa_processor, vqa_model, DEVICE,
+    fetch_image, yes_no_from_text, leds_from_flags
+)
 
-MODEL_ID = os.getenv("MODEL_ID", "Salesforce/blip-image-captioning-large")
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+# Cold start: modellek beolvasása
+load_models()
 
-log.info(f"Loading model {MODEL_ID} on {DEVICE}…")
-processor = BlipProcessor.from_pretrained(MODEL_ID)
-model = BlipForConditionalGeneration.from_pretrained(MODEL_ID)
-model.to(DEVICE)
-model.eval()
+async def do_caption(image_url: str, req_id: str) -> Dict[str, Any]:
+    img: Image.Image = await fetch_image(image_url)
+    inputs = caption_processor(images=img, return_tensors="pt").to(DEVICE)
+    out_ids = caption_model.generate(**inputs, max_new_tokens=32, num_beams=3, repetition_penalty=1.2)
+    text = caption_processor.decode(out_ids[0], skip_special_tokens=True).strip()
+    return {"id": req_id, "caption": text, "model_ready_at": time.time()}
 
-class Req(BaseModel):
-    id: str
-    image: HttpUrl
+async def do_analyze(image_url: str, questions: Optional[List[str]], req_id: str) -> Dict[str, Any]:
+    img: Image.Image = await fetch_image(image_url)
+    qs = questions or [
+        "Fine lines visible?", "Skin looks oily?", "Uneven skin texture?",
+        "Acne or pimples visible?", "Clogged pores visible?", "Deep wrinkles visible?",
+        "Skin looks saggy?", "Skin looks tired?", "Skin discoloration visible?",
+        "Pigmentation spots visible?", "Aging signs with breakouts?", "Cheeks skin textured?",
+        "Skin looks stressed?", "Multiple mild skin issues visible?", "Dry or flaky skin visible?"
+    ]
+    answers = {}
+    for q in qs:
+        inputs = vqa_processor(images=img, text=f"Question: {q} Answer:", return_tensors="pt").to(DEVICE)
+        out = vqa_model.generate(**inputs, max_new_tokens=5, num_beams=3, length_penalty=0.0)
+        raw = vqa_processor.decode(out[0], skip_special_tokens=True)
+        answers[q] = yes_no_from_text(raw)
+    led_modes = leds_from_flags(answers)
+    return {
+        "id": req_id,
+        "answers": answers,
+        "led_modes": led_modes,
+        "rationale": ", ".join([k for k, v in answers.items() if v == "yes"]) or "none with high confidence",
+        "model_ready_at": time.time(),
+    }
 
-app = FastAPI()
+def handler(event: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Várt bemenet (Queue):
+    {
+      "input": {
+        "task": "caption" | "analyze",
+        "id": "test-1",
+        "image": "https://...jpg",
+        "questions": ["..."]   # csak analyze-hoz, opcionális
+      }
+    }
+    """
+    inp = event.get("input") or {}
+    task = (inp.get("task") or "caption").lower()
+    req_id = str(inp.get("id") or "")
+    image = inp.get("image")
+    questions = inp.get("questions")
 
-@app.post("/analyze")
-async def analyze(req: Req):
-    # 1) letöltés
-    try:
-        async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
-            r = await client.get(str(req.image))
-            r.raise_for_status()
-            img = Image.open(io.BytesIO(r.content)).convert("RGB")
-    except Exception as e:
-        log.error(f"download failed: {e}")
-        raise HTTPException(502, "Image download failed")
+    if not image:
+        return {"error": "missing field: image"}
 
-    # 2) prompt + generálás (hosszabb, célzott leíráshoz)
-    prompt = (
-        "Describe the face skin in 3-5 sentences: tone, redness, pores, acne, "
-        "wrinkles, pigmentation, dryness or oiliness. Be specific but neutral."
-    )
+    import asyncio
+    if task == "analyze":
+        return asyncio.run(do_analyze(image, questions, req_id))
+    else:
+        return asyncio.run(do_caption(image, req_id))
 
-    inputs = processor(images=img, text=prompt, return_tensors="pt").to(DEVICE)
-    with torch.no_grad():
-        out = model.generate(
-            **inputs,
-            max_new_tokens=80,            # hosszabb szöveg
-            num_beams=4,                  # minőség
-            length_penalty=1.0,
-            no_repeat_ngram_size=3
-        )
-    caption = processor.decode(out[0], skip_special_tokens=True).strip()
-    if not caption:
-        caption = "No clear findings."
-
-    return {"caption": caption}
+runpod.serverless.start({"handler": handler})
