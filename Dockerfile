@@ -4,24 +4,18 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     git wget curl build-essential && \
     rm -rf /var/lib/apt/lists/*
 
+# HF cache helye (a RunPodon ide fogjuk mountolni a volume-ot)
 ENV HF_HOME=/root/.cache/huggingface \
     TRANSFORMERS_CACHE=/root/.cache/huggingface \
-    PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 
 WORKDIR /app
 
-COPY requirements.txt ./
+COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# másoljuk az egész appot
+# teljes kód
 COPY . .
 
-# FastAPI default port a RunPodon
-EXPOSE 8080
-
-HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=5 \
-  CMD curl -f http://localhost:8080/healthz || exit 1
-
-# nálad app.py-ben az app neve app:app
-CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8080"]
+# Queue: worker indul, nem HTTP
+CMD ["python", "-u", "worker.py"]
