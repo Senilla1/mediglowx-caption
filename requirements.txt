@@ -9,3 +9,4 @@ sentencepiece==0.2.0
 timm==0.9.16
 huggingface_hub>=0.24.0
 hf-transfer==0.1.6
+runpod
