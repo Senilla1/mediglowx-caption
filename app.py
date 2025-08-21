@@ -1,5 +1,6 @@
 # app.py — MediGlowX BLIP API (Render proxy + RunPod serverless támogatás)
 import os
+import asyncio
 import time
 from io import BytesIO
 from typing import List, Optional, Dict, Any
@@ -144,8 +145,9 @@ def load_models() -> None:
     MODEL_READY_AT = time.time()
     logger.info("Models ready at %.3f", MODEL_READY_AT)
 
-load_models()
-
+# csak akkor töltsön modellt, ha NEM RunPod proxy
+if os.getenv("USE_RUNPOD", "0") != "1":
+    load_models()
 # -----------------------------------------------------------------------------
 # Helpers
 # -----------------------------------------------------------------------------
@@ -287,6 +289,16 @@ def healthz() -> Dict[str, Any]:
 
 @app.post("/caption", response_model=CaptionResponse)
 async def caption(body: CaptionRequest):
+    # PROXY mód Renderen: küldd a RunPod Queue-ra
+    if USE_RUNPOD == "1":
+        out = await call_runpod_queue("caption", str(body.image))
+        return CaptionResponse(
+            id=body.id,
+            caption=str(out.get("caption", "")),
+            model_ready_at=float(out.get("model_ready_at", 0.0)),
+        )
+
+    # LOKÁLIS inferencia (RunPodon USE_RUNPOD=0)
     if caption_model is None or caption_processor is None:
         raise HTTPException(status_code=503, detail="Caption model not loaded")
 
@@ -304,39 +316,65 @@ async def caption(body: CaptionRequest):
 
 @app.post("/analyze", response_model=AnalyzeResponse)
 async def analyze(body: AnalyzeRequest):
-    logger.info("analyze:start req_id=%s", body.id)
+    # PROXY mód Renderen → RunPod Queue
+    if USE_RUNPOD == "1":
+        out = await call_runpod_queue(
+            "analyze",
+            str(body.image),
+            body.questions or DEFAULT_QUESTIONS
+        )
+        return AnalyzeResponse(
+            id=body.id,
+            answers=dict(out.get("answers", {})),
+            led_modes=list(out.get("led_modes", [])),
+            rationale=str(out.get("rationale", "")),
+            model_ready_at=float(out.get("model_ready_at", 0.0)),
+        )
 
-    # --- ÚJ: ha USE_RUNPOD=1, továbbítunk a RunPod Serverless BLIP-nek ---
-    if USE_RUNPOD:
-        try:
-            runpod = await call_runpod_analyze(str(body.image), body.questions or DEFAULT_QUESTIONS)
+    # ── LOKÁLIS VQA + postprocess ──
+    if vqa_model is None or vqa_processor is None:
+        raise HTTPException(status_code=503, detail="VQA model not loaded")
 
-            answers: Dict[str, str] = {}
-            # ha a RunPod csak captiont ad
-            if isinstance(runpod, dict) and "caption" in runpod:
-                answers["General skin state"] = str(runpod["caption"])
-            # ha a RunPod VQA válaszokat is ad
-            if "answers" in runpod and isinstance(runpod["answers"], dict):
-                # normalizáljuk yes/no/unsure alakra
-                for k, v in runpod["answers"].items():
-                    answers[str(k)] = yes_no_from_text(str(v))
+    t0 = time.time()
+    img = await fetch_image(str(body.image))
+    t1 = time.time()
 
-            led_modes = leds_from_flags(answers)
-            positives = [k for k, v in answers.items() if v == "yes"]
-            rationale = ", ".join(positives) if positives else "none with high confidence"
+    qs: List[str] = body.questions or DEFAULT_QUESTIONS
+    answers: Dict[str, str] = {}
 
-            return AnalyzeResponse(
-                id=body.id,
-                answers=answers,
-                led_modes=led_modes,
-                rationale=rationale,
-                model_ready_at=MODEL_READY_AT,
+    with torch.inference_mode():
+        for q in qs:
+            vqa_inputs = vqa_processor(
+                images=img,
+                text=f"Question: {q} Answer:",
+                return_tensors="pt"
+            ).to(DEVICE)
+            out = vqa_model.generate(
+                **vqa_inputs,
+                max_new_tokens=5,
+                num_beams=3,
+                length_penalty=0.0,
             )
-        except HTTPException:
-            raise
-        except Exception as e:
-            logger.exception("runpod_proxy_error req_id=%s err=%s", body.id, e)
-            raise HTTPException(status_code=502, detail=f"RunPod proxy failed: {e}")
+            raw = vqa_processor.decode(out[0], skip_special_tokens=True)
+            answers[q] = yes_no_from_text(raw)
+
+    positives = [k for k, v in answers.items() if v == "yes"]
+    rationale = ", ".join(positives) if positives else "none with high confidence"
+    led_modes = leds_from_flags(answers)
+
+    t2 = time.time()
+    logger.info(
+        "analyze: timings download=%.3f infer=%.3f post=%.3f total=%.3f flags=%s",
+        t1 - t0, t2 - t1, time.time() - t2, time.time() - t0, answers
+    )
+
+    return AnalyzeResponse(
+        id=body.id,
+        answers=answers,
+        led_modes=led_modes,
+        rationale=rationale,
+        model_ready_at=MODEL_READY_AT,
+    )
 
     # --- LOKÁLIS (Render gépen futó) BLIP VQA + postprocess — eredeti logika ---
     if vqa_model is None or vqa_processor is None:
