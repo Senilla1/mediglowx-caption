@@ -221,28 +221,41 @@ def leds_from_flags(flags: Dict[str, str]) -> List[str]:
 # -----------------------------------------------------------------------------
 # RunPod proxy támogatás (kapcsolóval)
 # -----------------------------------------------------------------------------
-USE_RUNPOD = os.getenv("USE_RUNPOD", "0") == "1"
-RUNPOD_URL = os.getenv("RUNPOD_URL", "").rstrip("/")  # pl. https://<id>.api.runpod.ai
-RUNPOD_TOKEN = os.getenv("RUNPOD_TOKEN", None)        # ha van auth
+# --- RunPod proxy (Queue API) ------------------------------------------------
+import asyncio  # ha még nincs felül importálva
 
-async def call_runpod_analyze(image_url: str, questions: Optional[List[str]]) -> Dict[str, Any]:
-    if not RUNPOD_URL:
-        raise HTTPException(status_code=503, detail="RUNPOD_URL is not configured")
+USE_RUNPOD = os.getenv("USE_RUNPOD", "0")
+RUNPOD_ENDPOINT_ID = os.getenv("RUNPOD_ENDPOINT_ID", "")  # pl. wy5mho4k9gqorm
+RUNPOD_TOKEN = os.getenv("RUNPOD_TOKEN", "")
+RUNPOD_BASE = f"https://api.runpod.ai/v2/{RUNPOD_ENDPOINT_ID}"
 
-    url = f"{RUNPOD_URL}/analyze"
-    headers: Dict[str, str] = {}
-    if RUNPOD_TOKEN:
-        headers["Authorization"] = f"Bearer {RUNPOD_TOKEN}"
+async def call_runpod_queue(mode: str, image_url: str, questions: Optional[List[str]] = None) -> Dict[str, Any]:
+    if not RUNPOD_ENDPOINT_ID:
+        raise HTTPException(status_code=503, detail="RUNPOD_ENDPOINT_ID not configured")
 
-    payload: Dict[str, Any] = {"id": "proxy", "image": image_url}
+    headers = {"Authorization": f"Bearer {RUNPOD_TOKEN}"}
+    payload: Dict[str, Any] = {"input": {"mode": mode, "id": "proxy", "image": image_url}}
     if questions:
-        payload["questions"] = questions
+        payload["input"]["questions"] = questions
 
-    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT, follow_redirects=True) as client:
-        r = await client.post(url, headers=headers, json=payload)
-    if r.status_code != 200:
-        raise HTTPException(status_code=502, detail=f"RunPod error {r.status_code}: {r.text}")
-    return r.json()
+    timeout = httpx.Timeout(connect=10.0, read=60.0, write=10.0)
+    async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as c:
+        r = await c.post(f"{RUNPOD_BASE}/run", headers=headers, json=payload)
+        if r.status_code >= 400:
+            raise HTTPException(status_code=502, detail=f"RunPod run error: {r.text}")
+        rid = r.json()["id"]
+
+        while True:
+            s = await c.get(f"{RUNPOD_BASE}/status/{rid}", headers=headers)
+            if s.status_code >= 400:
+                raise HTTPException(status_code=502, detail=f"RunPod status error: {s.text}")
+            data = s.json()
+            st = data.get("status", "")
+            if st == "COMPLETED":
+                return data.get("output", {})
+            if st in {"FAILED", "CANCELLED", "TIMED_OUT"}:
+                raise HTTPException(status_code=502, detail=f"RunPod job {st.lower()}")
+            await asyncio.sleep(1.0)
 
 # --- minimal health endpoints for RunPod LB ---
 @app.get("/")
