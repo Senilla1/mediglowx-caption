@@ -240,9 +240,8 @@ async def call_runpod_queue(mode: str, image_url: str, questions: Optional[List[
     if questions:
         payload["input"]["questions"] = questions
 
-    timeout = httpx.Timeout(connect=10.0, read=60.0, write=10.0)
-    async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as c:
-        r = await c.post(f"{RUNPOD_BASE}/run", headers=headers, json=payload)
+async with httpx.AsyncClient(timeout=HTTP_TIMEOUT, follow_redirects=True) as client:
+        r = await client.post(f"{RUNPOD_BASE}/run", headers=headers, json=payload)
         if r.status_code >= 400:
             raise HTTPException(status_code=502, detail=f"RunPod run error: {r.text}")
         rid = r.json()["id"]
