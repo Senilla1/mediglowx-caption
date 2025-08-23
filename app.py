@@ -247,7 +247,7 @@ async def call_runpod_queue(mode: str, image_url: str, questions: Optional[List[
         rid = r.json()["id"]
 
         while True:
-            s = await c.get(f"{RUNPOD_BASE}/status/{rid}", headers=headers)
+            s = await client.get(f"{RUNPOD_BASE}/status/{rid}", headers=headers)
             if s.status_code >= 400:
                 raise HTTPException(status_code=502, detail=f"RunPod status error: {s.text}")
             data = s.json()
