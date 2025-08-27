@@ -12,4 +12,5 @@ hf-transfer==0.1.6
 runpod==1.6.1
 mediapipe==0.10.14
 opencv-python-headless==4.10.0.84
-numpy>=1.23
+numpy>=1.23,<2.0
+protobuf>=3.20,<5
