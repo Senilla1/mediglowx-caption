@@ -11,8 +11,8 @@ huggingface_hub==0.24.0
 hf-transfer==0.1.6
 runpod==1.6.1
 
-# --- Vision függőségek (mediapipe + opencv) stabil pin ---
+# --- Vision függőségek (mediapipe + opencv) ---
 numpy==1.26.4
-protobuf==3.20.3
 opencv-python-headless==4.10.0.84
 mediapipe==0.10.14
+protobuf>=4.23.4,<5
