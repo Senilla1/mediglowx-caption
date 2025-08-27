@@ -7,10 +7,12 @@ transformers==4.43.3
 accelerate==0.33.0
 sentencepiece==0.2.0
 timm==0.9.16
-huggingface_hub>=0.24.0
+huggingface_hub==0.24.0
 hf-transfer==0.1.6
 runpod==1.6.1
-mediapipe==0.10.14
+
+# --- Vision függőségek (mediapipe + opencv) stabil pin ---
+numpy==1.26.4
+protobuf==3.20.3
 opencv-python-headless==4.10.0.84
-numpy>=1.23,<2.0
-protobuf>=3.20,<5
+mediapipe==0.10.14
