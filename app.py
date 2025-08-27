@@ -354,10 +354,6 @@ def root():
 def ping():
     return {"ok": True}
 
-@app.get("/health")
-def health() -> Dict[str, Any]:
-    return {
-        "ok": True,
         "model_loaded": all(x is not None for x in [caption_model, caption_processor, vqa_model, vqa_processor]),
         "model_ready_at": MODEL_READY_AT,
         "uptime_s": time.time() - APP_START_TS,
@@ -406,7 +402,7 @@ async def analyze(body: AnalyzeRequest):
             str(body.image),
             body.questions or DEFAULT_QUESTIONS
         )
-        # ha egyszer a RunPod is ad metrics/auto_flags-ot, itt töltsd vissza
+        # Ha a RunPod JSON-ben benne vannak, így húzzuk ki:
         return AnalyzeResponse(
             id=body.id,
             answers=dict(out.get("answers", {})),
@@ -425,11 +421,11 @@ async def analyze(body: AnalyzeRequest):
     img = await fetch_image(str(body.image))
     t1 = time.time()
 
-    # Dark-circle mérés (nem dob hibát, ha nincs vision stack)
+    # ---- Dark-circle mérés (nem dob hibát, ha nincs vision stack) ----
     try:
         image_rgb = np.array(img.convert('RGB'))
         dc = detect_dark_circles(image_rgb)
-        metrics    = {'dark_circles_score': float(dc.get('dark_circles_score', 0.0))}
+        metrics = {'dark_circles_score': float(dc.get('dark_circles_score', 0.0))}
         auto_flags = {'dark_circles': bool(dc.get('dark_circles', False))}
     except Exception as e:
         logger.exception("dark circle calc error: %s", e)
@@ -437,9 +433,9 @@ async def analyze(body: AnalyzeRequest):
 
     logger.info("auto_flags=%s metrics=%s", auto_flags, metrics)
 
+    # 2) Kérdés–válasz inferencia
     qs: List[str] = body.questions or DEFAULT_QUESTIONS
     answers: Dict[str, str] = {}
-
     with torch.inference_mode():
         for q in qs:
             vqa_inputs = vqa_processor(
@@ -472,8 +468,8 @@ async def analyze(body: AnalyzeRequest):
         led_modes=led_modes,
         rationale=rationale,
         model_ready_at=MODEL_READY_AT,
-        metrics=metrics,
-        auto_flags=auto_flags,
+        metrics=metrics,          # <-- EZ A KÉT SOR A LÉNYEG
+        auto_flags=auto_flags,    # <--
     )
 
 # -----------------------------------------------------------------------------
