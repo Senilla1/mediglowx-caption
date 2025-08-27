@@ -359,9 +359,9 @@ def ping():
         "uptime_s": time.time() - APP_START_TS,
     }
 
-@app.get("/healthz")
-def healthz() -> Dict[str, Any]:
-    return {"ok": True}
+@app.get("/health")
+def health() -> Dict[str, Any]:
+    return {"ok": True, "model_loaded": all(x is not None for x in [caption_model, caption_processor, vqa_model, vqa_processor]), "model_ready_at": MODEL_READY_AT, "uptime_s": time.time() - APP_START_TS}
 
 # -----------------------------------------------------------------------------
 # Endpoints
