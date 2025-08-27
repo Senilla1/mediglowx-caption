@@ -10,3 +10,6 @@ timm==0.9.16
 huggingface_hub>=0.24.0
 hf-transfer==0.1.6
 runpod==1.6.1
+mediapipe==0.10.14
+opencv-python-headless==4.10.0.84
+numpy>=1.23
