@@ -8,11 +8,13 @@ from typing import List, Optional, Dict, Any
 import logging
 import httpx
 import torch
+import cv2
+import numpy as np
+import mediapipe as mp
 from PIL import Image
 
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, HttpUrl
-
+from pydantic import BaseModel, HttpUrl, Field
 # Transformers
 from transformers import (
     BlipProcessor,
@@ -55,10 +57,12 @@ class AnalyzeRequest(BaseModel):
 
 class AnalyzeResponse(BaseModel):
     id: str
-    answers: Dict[str, str]                 # pl. {"Fine lines visible?": "yes/no/unsure", ...}
-    led_modes: List[str]                    # ajánlott LED módok
-    rationale: str                          # rövid összefoglaló
-    model_ready_at: float
+    answers: Dict[str, str]
+    led_modes: List[Dict[str, Any]] = Field(default_factory=list)    rationale: str = ""
+    model_ready_at: float = 0.0
+    # ÚJ mezők:
+    metrics: Dict[str, float] = Field(default_factory=dict)
+    auto_flags: Dict[str, bool] = Field(default_factory=dict)
 
 
 # Opcionális "final result" fogadó endpointhoz (nálatok már megvolt)
@@ -113,7 +117,111 @@ DEFAULT_QUESTIONS = [
     "Multiple mild skin issues visible?",
     "Dry or flaky skin visible?",
 ]
+# ===== Dark-circle (under-eye) mérő: MediaPipe Face Mesh + LAB összehasonlítás =====
+_mp_face = mp.solutions.face_mesh
 
+def _to_uint8(img):
+    arr = np.asarray(img)
+    if arr.dtype != np.uint8:
+        arr = np.clip(arr, 0, 255).astype(np.uint8)
+    return arr
+
+def _roi(img, x1, y1, x2, y2):
+    h, w = img.shape[:2]
+    x1 = max(0, min(w-1, int(x1))); x2 = max(0, min(w-1, int(x2)))
+    y1 = max(0, min(h-1, int(y1))); y2 = max(0, min(h-1, int(y2)))
+    if x2 <= x1 or y2 <= y1:
+        return None
+    return img[y1:y2, x1:x2]
+
+def detect_dark_circles(image_rgb) -> dict:
+    """
+    Visszaad: {'dark_circles': bool, 'dark_circles_score': float, 'debug': {...}}
+    Heuriszta: under-eye régió L* (LAB) sötétebb-e a referencia (cheek) régiónál,
+    és mennyivel kékesebb (b* kisebb).
+    """
+    img = _to_uint8(image_rgb)
+    h, w = img.shape[:2]
+
+    with _mp_face.FaceMesh(static_image_mode=True, max_num_faces=1, refine_landmarks=True) as fm:
+        res = fm.process(cv2.cvtColor(img, cv2.COLOR_RGB2BGR))
+        if not res.multi_face_landmarks:
+            return {'dark_circles': False, 'dark_circles_score': 0.0}
+
+        lm = res.multi_face_landmarks[0].landmark
+        def P(i): return np.array([lm[i].x*w, lm[i].y*h])
+
+        # Landmark indexek (MediaPipe 468-pontos mesh)
+        L_OUT, L_IN, L_BOTTOM = 33, 133, 145
+        R_OUT, R_IN, R_BOTTOM = 263, 362, 374
+
+        pL_out, pL_in, pL_b = P(L_OUT), P(L_IN), P(L_BOTTOM)
+        pR_out, pR_in, pR_b = P(R_OUT), P(R_IN), P(R_BOTTOM)
+
+        # Inter-ocular distance mint skála
+        iod = np.linalg.norm(pL_in - pR_in) + 1e-6
+
+        # Under-eye és cheek téglalapok
+        def under_eye_rect(p_out, p_in, p_bot):
+            x1 = min(p_out[0], p_in[0]) - 0.05*iod
+            x2 = max(p_out[0], p_in[0]) + 0.05*iod
+            y1 = p_bot[1] + 0.12*iod
+            y2 = p_bot[1] + 0.45*iod
+            return int(x1), int(y1), int(x2), int(y2)
+
+        def cheek_rect(p_out, p_in, p_bot):
+            x1 = min(p_out[0], p_in[0]) - 0.05*iod
+            x2 = max(p_out[0], p_in[0]) + 0.05*iod
+            y1 = p_bot[1] + 0.55*iod
+            y2 = p_bot[1] + 0.95*iod
+            return int(x1), int(y1), int(x2), int(y2)
+
+        rects = [
+            under_eye_rect(pL_out, pL_in, pL_b),
+            under_eye_rect(pR_out, pR_in, pR_b),
+        ]
+        cheeks = [
+            cheek_rect(pL_out, pL_in, pL_b),
+            cheek_rect(pR_out, pR_in, pR_b),
+        ]
+
+        lab = cv2.cvtColor(img, cv2.COLOR_RGB2LAB)
+        Lc, ac, bc = cv2.split(lab)
+
+        def mean_lab(r):
+            if r is None: return None
+            x1,y1,x2,y2 = r
+            roiL = _roi(Lc, x1,y1,x2,y2); roiB = _roi(bc, x1,y1,x2,y2)
+            if roiL is None or roiB is None: return None
+            return float(np.mean(roiL)), float(np.mean(roiB))
+
+        vals_under = [mean_lab(r) for r in rects]
+        vals_cheek = [mean_lab(r) for r in cheeks]
+        vals_under = [v for v in vals_under if v is not None]
+        vals_cheek = [v for v in vals_cheek if v is not None]
+        if not vals_under or not vals_cheek:
+            return {'dark_circles': False, 'dark_circles_score': 0.0}
+
+        L_under = np.mean([v[0] for v in vals_under])
+        B_under = np.mean([v[1] for v in vals_under])
+        L_cheek = np.mean([v[0] for v in vals_cheek])
+        B_cheek = np.mean([v[1] for v in vals_cheek])
+
+        dL = L_cheek - L_under      # + ha under-eye sötétebb
+        dB = B_cheek - B_under      # + ha under-eye "kékebb"
+
+        # Normalizált pontszám [0..1]
+        l_drop = max(0.0, dL / 40.0)
+        b_drop = max(0.0, dB / 20.0)
+        score  = float(np.clip(0.7*l_drop + 0.3*b_drop, 0.0, 1.0))
+
+        detected = (dL > 8 and score > 0.12)  # küszöbök finomíthatók
+
+        return {
+            'dark_circles': bool(detected),
+            'dark_circles_score': round(score, 3),
+            'debug': {'dL': round(dL,2), 'dB': round(dB,2)}
+        }
 # -----------------------------------------------------------------------------
 # Load models at startup (with warm-up)
 # -----------------------------------------------------------------------------
@@ -323,11 +431,13 @@ async def analyze(body: AnalyzeRequest):
             body.questions or DEFAULT_QUESTIONS
         )
         return AnalyzeResponse(
-            id=body.id,
-            answers=dict(out.get("answers", {})),
-            led_modes=list(out.get("led_modes", [])),
-            rationale=str(out.get("rationale", "")),
-            model_ready_at=float(out.get("model_ready_at", 0.0)),
+    id=body.id,
+    answers=answers,
+    led_modes=led_modes,
+    rationale=str(out.get("rationale", "")),
+    model_ready_at=float(out.get("model_ready_at", 0.0)),
+    metrics=metrics,
+    auto_flags=auto_flags,
         )
 
     # ── LOKÁLIS VQA + postprocess ──
@@ -340,6 +450,7 @@ async def analyze(body: AnalyzeRequest):
 
     qs: List[str] = body.questions or DEFAULT_QUESTIONS
     answers: Dict[str, str] = {}
+    
 
     with torch.inference_mode():
         for q in qs:
@@ -383,6 +494,16 @@ async def analyze(body: AnalyzeRequest):
     # 1) Kép letöltés
     img = await fetch_image(str(body.image))
     t1 = time.time()
+    try:
+        image_rgb = np.array(img.convert('RGB'))
+        dc = detect_dark_circles(image_rgb)
+        metrics    = {'dark_circles_score': float(dc.get('dark_circles_score', 0.0))}
+        auto_flags = {'dark_circles': bool(dc.get('dark_circles', False))}
+    except Exception as e:
+        logger.exception("dark circle calc error: %s", e)
+        metrics, auto_flags = {}, {}
+
+    logger.info("dc_measure id=%s auto_flags=%s metrics=%s", body.id, auto_flags, metrics)
 
     # 2) Kérdés–válasz inferencia
     qs: List[str] = body.questions or DEFAULT_QUESTIONS
