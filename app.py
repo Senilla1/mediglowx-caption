@@ -8,13 +8,12 @@ from typing import List, Optional, Dict, Any
 import logging
 import httpx
 import torch
-import cv2
 import numpy as np
-import mediapipe as mp
 from PIL import Image
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, HttpUrl, Field
+
 # Transformers
 from transformers import (
     BlipProcessor,
@@ -23,21 +22,35 @@ from transformers import (
     BlipForQuestionAnswering,  # alias of BLIP for VQA ckpt
 )
 
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------
+# Optional vision deps (cv2 + mediapipe) – lazy import, safe fallback
+# ---------------------------------------------------------------------
+_HAS_VISION = True
+try:
+    import cv2  # type: ignore
+    import mediapipe as mp  # type: ignore
+    __mp_face = mp.solutions.face_mesh
+except Exception:
+    _HAS_VISION = False
+    cv2 = None       # type: ignore
+    mp = None        # type: ignore
+    __mp_face = None
+
+# ---------------------------------------------------------------------
 # Logging
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 APP_START_TS = time.time()
 
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------
 # FastAPI
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------
 app = FastAPI(title="MediGlowX BLIP API", version="1.0.0")
 
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------
 # Schemas
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------
 class CaptionRequest(BaseModel):
     id: str
     image: HttpUrl
@@ -58,9 +71,10 @@ class AnalyzeRequest(BaseModel):
 class AnalyzeResponse(BaseModel):
     id: str
     answers: Dict[str, str]
-    led_modes: List[Dict[str, Any]] = Field(default_factory=list)    rationale: str = ""
+    led_modes: List[Dict[str, Any]] = Field(default_factory=list)
+    rationale: str = ""
     model_ready_at: float = 0.0
-    # ÚJ mezők:
+    # ÚJ mezők
     metrics: Dict[str, float] = Field(default_factory=dict)
     auto_flags: Dict[str, bool] = Field(default_factory=dict)
 
@@ -79,10 +93,9 @@ class ReceiveResponse(BaseModel):
     ok: bool
     payload: Dict[str, Any]
 
-
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------
 # Model config
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 CAPTION_MODEL_NAME = "Salesforce/blip-image-captioning-large"
@@ -96,9 +109,9 @@ vqa_model: Optional[BlipForQuestionAnswering] = None
 
 MODEL_READY_AT: float = 0.0
 
-# -----------------------------------------------------------------------------
-# Default kérdések (a ti listátok alapján)
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------
+# Default kérdések
+# ---------------------------------------------------------------------
 DEFAULT_QUESTIONS = [
     "Fine lines visible?",
     "Skin looks dull?",
@@ -117,9 +130,10 @@ DEFAULT_QUESTIONS = [
     "Multiple mild skin issues visible?",
     "Dry or flaky skin visible?",
 ]
-# ===== Dark-circle (under-eye) mérő: MediaPipe Face Mesh + LAB összehasonlítás =====
-_mp_face = mp.solutions.face_mesh
 
+# ---------------------------------------------------------------------
+# Dark-circle mérés (MediaPipe Face Mesh + LAB), guarddal
+# ---------------------------------------------------------------------
 def _to_uint8(img):
     arr = np.asarray(img)
     if arr.dtype != np.uint8:
@@ -135,15 +149,14 @@ def _roi(img, x1, y1, x2, y2):
     return img[y1:y2, x1:x2]
 
 def detect_dark_circles(image_rgb) -> dict:
-    """
-    Visszaad: {'dark_circles': bool, 'dark_circles_score': float, 'debug': {...}}
-    Heuriszta: under-eye régió L* (LAB) sötétebb-e a referencia (cheek) régiónál,
-    és mennyivel kékesebb (b* kisebb).
-    """
+    # ha nincs vision deps, ne dobjunk hibát
+    if not _HAS_VISION or __mp_face is None:
+        return {'dark_circles': False, 'dark_circles_score': 0.0, 'debug': {'reason': 'deps-missing'}}
+
     img = _to_uint8(image_rgb)
     h, w = img.shape[:2]
 
-    with _mp_face.FaceMesh(static_image_mode=True, max_num_faces=1, refine_landmarks=True) as fm:
+    with __mp_face.FaceMesh(static_image_mode=True, max_num_faces=1, refine_landmarks=True) as fm:
         res = fm.process(cv2.cvtColor(img, cv2.COLOR_RGB2BGR))
         if not res.multi_face_landmarks:
             return {'dark_circles': False, 'dark_circles_score': 0.0}
@@ -151,17 +164,14 @@ def detect_dark_circles(image_rgb) -> dict:
         lm = res.multi_face_landmarks[0].landmark
         def P(i): return np.array([lm[i].x*w, lm[i].y*h])
 
-        # Landmark indexek (MediaPipe 468-pontos mesh)
         L_OUT, L_IN, L_BOTTOM = 33, 133, 145
         R_OUT, R_IN, R_BOTTOM = 263, 362, 374
 
         pL_out, pL_in, pL_b = P(L_OUT), P(L_IN), P(L_BOTTOM)
         pR_out, pR_in, pR_b = P(R_OUT), P(R_IN), P(R_BOTTOM)
 
-        # Inter-ocular distance mint skála
         iod = np.linalg.norm(pL_in - pR_in) + 1e-6
 
-        # Under-eye és cheek téglalapok
         def under_eye_rect(p_out, p_in, p_bot):
             x1 = min(p_out[0], p_in[0]) - 0.05*iod
             x2 = max(p_out[0], p_in[0]) + 0.05*iod
@@ -176,17 +186,12 @@ def detect_dark_circles(image_rgb) -> dict:
             y2 = p_bot[1] + 0.95*iod
             return int(x1), int(y1), int(x2), int(y2)
 
-        rects = [
-            under_eye_rect(pL_out, pL_in, pL_b),
-            under_eye_rect(pR_out, pR_in, pR_b),
-        ]
-        cheeks = [
-            cheek_rect(pL_out, pL_in, pL_b),
-            cheek_rect(pR_out, pR_in, pR_b),
-        ]
+        rects = [under_eye_rect(pL_out, pL_in, pL_b), under_eye_rect(pR_out, pR_in, pR_b)]
+        cheeks = [cheek_rect(pL_out, pL_in, pL_b), cheek_rect(pR_out, pR_in, pR_b)]
 
         lab = cv2.cvtColor(img, cv2.COLOR_RGB2LAB)
-        Lc, ac, bc = cv2.split(lab)
+        Lc, ac, bc = np.dsplit(lab, 3)
+        Lc, bc = Lc.squeeze(-1), bc.squeeze(-1)
 
         def mean_lab(r):
             if r is None: return None
@@ -195,10 +200,8 @@ def detect_dark_circles(image_rgb) -> dict:
             if roiL is None or roiB is None: return None
             return float(np.mean(roiL)), float(np.mean(roiB))
 
-        vals_under = [mean_lab(r) for r in rects]
-        vals_cheek = [mean_lab(r) for r in cheeks]
-        vals_under = [v for v in vals_under if v is not None]
-        vals_cheek = [v for v in vals_cheek if v is not None]
+        vals_under = [v for v in (mean_lab(r) for r in rects) if v is not None]
+        vals_cheek = [v for v in (mean_lab(r) for r in cheeks) if v is not None]
         if not vals_under or not vals_cheek:
             return {'dark_circles': False, 'dark_circles_score': 0.0}
 
@@ -207,24 +210,24 @@ def detect_dark_circles(image_rgb) -> dict:
         L_cheek = np.mean([v[0] for v in vals_cheek])
         B_cheek = np.mean([v[1] for v in vals_cheek])
 
-        dL = L_cheek - L_under      # + ha under-eye sötétebb
-        dB = B_cheek - B_under      # + ha under-eye "kékebb"
+        dL = L_cheek - L_under
+        dB = B_cheek - B_under
 
-        # Normalizált pontszám [0..1]
         l_drop = max(0.0, dL / 40.0)
         b_drop = max(0.0, dB / 20.0)
         score  = float(np.clip(0.7*l_drop + 0.3*b_drop, 0.0, 1.0))
 
-        detected = (dL > 8 and score > 0.12)  # küszöbök finomíthatók
+        detected = (dL > 8 and score > 0.12)
 
         return {
             'dark_circles': bool(detected),
             'dark_circles_score': round(score, 3),
             'debug': {'dL': round(dL,2), 'dB': round(dB,2)}
         }
-# -----------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------
 # Load models at startup (with warm-up)
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------
 def load_models() -> None:
     global caption_processor, caption_model, vqa_processor, vqa_model, MODEL_READY_AT
 
@@ -233,8 +236,7 @@ def load_models() -> None:
     logger.info("Loading BLIP models.. device=%s", DEVICE)
 
     # BLIP caption
-    from transformers import AutoProcessor
-    caption_processor = AutoProcessor.from_pretrained(CAPTION_MODEL_NAME)    
+    caption_processor = AutoProcessor.from_pretrained(CAPTION_MODEL_NAME)
     caption_model = BlipForConditionalGeneration.from_pretrained(CAPTION_MODEL_NAME).to(DEVICE)
 
     # BLIP VQA
@@ -256,9 +258,10 @@ def load_models() -> None:
 # csak akkor töltsön modellt, ha NEM RunPod proxy
 if os.getenv("USE_RUNPOD", "0") != "1":
     load_models()
-# -----------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------
 # Helpers
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------
 HTTP_TIMEOUT = httpx.Timeout(connect=5.0, read=30.0, write=10.0, pool=10.0)
 
 async def fetch_image(url: str) -> Image.Image:
@@ -277,65 +280,41 @@ def yes_no_from_text(txt: str) -> str:
         return "yes"
     if t in ("n", "no", "nope", "false"):
         return "no"
-    # gyakori egy szavas alternatívák
     if t in ("oily", "acne", "redness"):
         return "yes"
     return "unsure"
 
 def leds_from_flags(flags: Dict[str, str]) -> List[str]:
-    """Egyszerű szabályok LED ajánláshoz – sorrendtartással és deduplikálással."""
     Y = lambda k: flags.get(k, "no") == "yes"
     leds: List[str] = []
-
-    # Blue
     if Y("Acne or pimples visible?") or Y("Clogged pores visible?") or Y("Skin looks oily?"):
         leds.append("Blue 465 nm")
-
-    # Red
     if Y("Fine lines visible?") or Y("Skin looks tired?") or Y("Uneven skin texture?"):
         leds.append("Red 630 nm")
-
-    # Red+NIR
     if Y("Deep wrinkles visible?") or Y("Skin looks saggy?"):
         leds.append("Near-IR 638-850+ nm")
-
-    # Green
     if Y("Pigmentation spots visible?") or Y("Skin discoloration visible?"):
         leds.append("Green 538 nm")
-
-    # Yellow
     if Y("Aging signs with breakouts?") or Y("Cheeks skin textured?") or Y("Skin looks oily?"):
         leds.append("Yellow 590 nm")
-
-    # Purple (aging + breakouts/texture)
     if (Y("Aging signs with breakouts?") and Y("Cheeks skin textured?")) or Y("Acne or pimples visible?"):
         leds.append("Purple 638+405 nm")
-
-    # Indigo (barrier + calming)
     if Y("Skin looks stressed?") or Y("Multiple mild skin issues visible?"):
         leds.append("Indigo 465+530 nm")
-
-    # White (mindenből kicsi)
     if Y("Multiple mild skin issues visible?") or Y("Dry or flaky skin visible?"):
         leds.append("White 630+530+465 nm")
-
-    # dedup, sorrend megtartásával
-    seen = set()
-    ordered: List[str] = []
+    # dedup
+    seen, ordered = set(), []
     for m in leds:
         if m not in seen:
-            ordered.append(m)
-            seen.add(m)
+            ordered.append(m); seen.add(m)
     return ordered
 
-# -----------------------------------------------------------------------------
-# RunPod proxy támogatás (kapcsolóval)
-# -----------------------------------------------------------------------------
-# --- RunPod proxy (Queue API) ------------------------------------------------
-import asyncio  # ha még nincs felül importálva
-
+# ---------------------------------------------------------------------
+# RunPod proxy támogatás
+# ---------------------------------------------------------------------
 USE_RUNPOD = os.getenv("USE_RUNPOD", "0")
-RUNPOD_ENDPOINT_ID = os.getenv("RUNPOD_ENDPOINT_ID", "")  # pl. wy5mho4k9gqorm
+RUNPOD_ENDPOINT_ID = os.getenv("RUNPOD_ENDPOINT_ID", "")
 RUNPOD_TOKEN = os.getenv("RUNPOD_TOKEN", "")
 RUNPOD_BASE = f"https://api.runpod.ai/v2/{RUNPOD_ENDPOINT_ID}"
 
@@ -366,7 +345,7 @@ async def call_runpod_queue(mode: str, image_url: str, questions: Optional[List[
                 raise HTTPException(status_code=502, detail=f"RunPod job {st.lower()}")
             await asyncio.sleep(1.0)
 
-# --- minimal health endpoints for RunPod LB ---
+# minimal LB endpoints
 @app.get("/")
 def root():
     return {"ok": True}
@@ -376,12 +355,6 @@ def ping():
     return {"ok": True}
 
 @app.get("/health")
-def health():
-    return {"ok": True}
-# -----------------------------------------------------------------------------
-# Endpoints
-# -----------------------------------------------------------------------------
-@app.get("/health")
 def health() -> Dict[str, Any]:
     return {
         "ok": True,
@@ -390,13 +363,11 @@ def health() -> Dict[str, Any]:
         "uptime_s": time.time() - APP_START_TS,
     }
 
-@app.get("/healthz")
-def healthz() -> Dict[str, Any]:
-    return {"ok": True}
-
+# ---------------------------------------------------------------------
+# Endpoints
+# ---------------------------------------------------------------------
 @app.post("/caption", response_model=CaptionResponse)
 async def caption(body: CaptionRequest):
-    # PROXY mód Renderen: küldd a RunPod Queue-ra
     if USE_RUNPOD == "1":
         out = await call_runpod_queue("caption", str(body.image))
         return CaptionResponse(
@@ -405,7 +376,6 @@ async def caption(body: CaptionRequest):
             model_ready_at=float(out.get("model_ready_at", 0.0)),
         )
 
-    # LOKÁLIS inferencia (RunPodon USE_RUNPOD=0)
     if caption_model is None or caption_processor is None:
         raise HTTPException(status_code=503, detail="Caption model not loaded")
 
@@ -423,24 +393,20 @@ async def caption(body: CaptionRequest):
 
 @app.post("/analyze", response_model=AnalyzeResponse)
 async def analyze(body: AnalyzeRequest):
-    # PROXY mód Renderen → RunPod Queue
+    # --- RunPod ág ---
     if USE_RUNPOD == "1":
-        out = await call_runpod_queue(
-            "analyze",
-            str(body.image),
-            body.questions or DEFAULT_QUESTIONS
-        )
+        out = await call_runpod_queue("analyze", str(body.image), body.questions or DEFAULT_QUESTIONS)
         return AnalyzeResponse(
-    id=body.id,
-    answers=answers,
-    led_modes=led_modes,
-    rationale=str(out.get("rationale", "")),
-    model_ready_at=float(out.get("model_ready_at", 0.0)),
-    metrics=metrics,
-    auto_flags=auto_flags,
+            id=body.id,
+            answers=dict(out.get("answers", {})),
+            led_modes=list(out.get("led_modes", [])),
+            rationale=str(out.get("rationale", "")),
+            model_ready_at=float(out.get("model_ready_at", 0.0)),
+            metrics=dict(out.get("metrics", {})),
+            auto_flags=dict(out.get("auto_flags", {})),
         )
 
-    # ── LOKÁLIS VQA + postprocess ──
+    # --- Lokális VQA + postprocess ---
     if vqa_model is None or vqa_processor is None:
         raise HTTPException(status_code=503, detail="VQA model not loaded")
 
@@ -448,17 +414,23 @@ async def analyze(body: AnalyzeRequest):
     img = await fetch_image(str(body.image))
     t1 = time.time()
 
+    # 1) Dark-circle mérés (nem kötelező)
+    try:
+        image_rgb = np.array(img.convert("RGB"))
+        dc = detect_dark_circles(image_rgb)
+        metrics    = {'dark_circles_score': float(dc.get('dark_circles_score', 0.0))}
+        auto_flags = {'dark_circles': bool(dc.get('dark_circles', False))}
+    except Exception as e:
+        logger.exception("dark circle calc error: %s", e)
+        metrics, auto_flags = {}, {}
+    logger.info("dc_measure id=%s auto_flags=%s metrics=%s", body.id, auto_flags, metrics)
+
+    # 2) Kérdés–válasz
     qs: List[str] = body.questions or DEFAULT_QUESTIONS
     answers: Dict[str, str] = {}
-    
-
     with torch.inference_mode():
         for q in qs:
-            vqa_inputs = vqa_processor(
-                images=img,
-                text=f"Question: {q} Answer:",
-                return_tensors="pt"
-            ).to(DEVICE)
+            vqa_inputs = vqa_processor(images=img, text=f"Question: {q} Answer:", return_tensors="pt").to(DEVICE)
             out = vqa_model.generate(
                 **vqa_inputs,
                 max_new_tokens=5,
@@ -468,6 +440,7 @@ async def analyze(body: AnalyzeRequest):
             raw = vqa_processor.decode(out[0], skip_special_tokens=True)
             answers[q] = yes_no_from_text(raw)
 
+    # 3) Postprocess
     positives = [k for k, v in answers.items() if v == "yes"]
     rationale = ", ".join(positives) if positives else "none with high confidence"
     led_modes = leds_from_flags(answers)
@@ -484,66 +457,13 @@ async def analyze(body: AnalyzeRequest):
         led_modes=led_modes,
         rationale=rationale,
         model_ready_at=MODEL_READY_AT,
+        metrics=metrics,
+        auto_flags=auto_flags,
     )
 
-    # --- LOKÁLIS (Render gépen futó) BLIP VQA + postprocess — eredeti logika ---
-    if vqa_model is None or vqa_processor is None:
-        raise HTTPException(status_code=503, detail="VQA model not loaded")
-
-    t0 = time.time()
-    # 1) Kép letöltés
-    img = await fetch_image(str(body.image))
-    t1 = time.time()
-    try:
-        image_rgb = np.array(img.convert('RGB'))
-        dc = detect_dark_circles(image_rgb)
-        metrics    = {'dark_circles_score': float(dc.get('dark_circles_score', 0.0))}
-        auto_flags = {'dark_circles': bool(dc.get('dark_circles', False))}
-    except Exception as e:
-        logger.exception("dark circle calc error: %s", e)
-        metrics, auto_flags = {}, {}
-
-    logger.info("dc_measure id=%s auto_flags=%s metrics=%s", body.id, auto_flags, metrics)
-
-    # 2) Kérdés–válasz inferencia
-    qs: List[str] = body.questions or DEFAULT_QUESTIONS
-    answers: Dict[str, str] = {}
-    with torch.inference_mode():
-        for q in qs:
-            inputs = vqa_processor(images=img, text=f"Question: {q} Answer:", return_tensors="pt").to(DEVICE)
-            out = vqa_model.generate(
-                **inputs,
-                max_new_tokens=5,
-                num_beams=3,
-                length_penalty=0.0,
-            )
-            raw = vqa_processor.decode(out[0], skip_special_tokens=True)
-            answers[q] = yes_no_from_text(raw)
-
-    t2 = time.time()
-
-    # 3) postprocess
-    positives = [k for k, v in answers.items() if v == "yes"]
-    rationale = ", ".join(positives) if positives else "none with high confidence"
-    led_modes = leds_from_flags(answers)
-    t3 = time.time()
-
-    logger.info(
-        "analyze:timings req_id=%s download=%.3f infer=%.3f post=%.3f total=%.3f flags=%s",
-        body.id, (t1 - t0), (t2 - t1), (t3 - t2), (t3 - t0), answers,
-    )
-
-    return AnalyzeResponse(
-        id=body.id,
-        answers=answers,
-        led_modes=led_modes,
-        rationale=rationale,
-        model_ready_at=MODEL_READY_AT,
-    )
-
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------
 # --- Eredmények ideiglenes tárhelye (HWP) ---
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------
 RESULTS: Dict[str, Dict[str, Any]] = {}
 
 @app.post("/receive", response_model=ReceiveResponse)
@@ -566,16 +486,16 @@ async def get_result(rid: str):
     data = RESULTS.get(rid, {})
     return {"ok": bool(data), "rid": rid, "data": data}
 
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------
 # CORS a Typedream és a saját domainekre
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------
 try:
     from fastapi.middleware.cors import CORSMiddleware
     app.add_middleware(
         CORSMiddleware,
         allow_origins=[
-            "https://skincheck.mediglowx.com",  # Typedream aldomain
-            "https://mediglowx.com",            # fődomain
+            "https://skincheck.mediglowx.com",
+            "https://mediglowx.com",
             "https://www.mediglowx.com",
         ],
         allow_credentials=True,
@@ -585,9 +505,9 @@ try:
 except Exception:
     pass
 
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------
 # Lokális futtatás (dev)
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------
 if __name__ == "__main__":
-    import uvicorn, os
+    import uvicorn
     uvicorn.run("app:app", host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
