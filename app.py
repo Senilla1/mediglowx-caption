@@ -104,6 +104,8 @@ DEFAULT_QUESTIONS = [
     "Skin looks oily?",
     "Skin discoloration visible?",
     "Pigmentation spots visible?",
+    "Facial redness visible (cheeks/nose/chin)?",
+    "Is redness widespread (multiple areas)?",
     "Aging signs with breakouts?",
     "Cheeks skin textured?",
     "Skin looks stressed?",
