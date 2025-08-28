@@ -111,6 +111,8 @@ DEFAULT_QUESTIONS = [
     "Skin looks stressed?",
     "Multiple mild skin issues visible?",
     "Dry or flaky skin visible?",
+    "Under-eye dark circles visible?",
+    "Under-eye puffiness/bags visible?"
 ]
 
 # -----------------------------------------------------------------------------
