@@ -345,22 +345,26 @@ async def call_runpod_queue(mode: str, image_url: str, questions: Optional[List[
                 raise HTTPException(status_code=502, detail=f"RunPod job {st.lower()}")
             await asyncio.sleep(1.0)
 
-# --- minimal health endpoints for RunPod LB ---
+# --- minimal health endpoints (single source of truth) ---
 @app.get("/")
-def root():
+def root() -> Dict[str, Any]:
     return {"ok": True}
 
 @app.get("/ping")
-def ping():
+def ping() -> Dict[str, Any]:
     return {"ok": True}
 
-        "model_loaded": all(x is not None for x in [caption_model, caption_processor, vqa_model, vqa_processor]),
+@app.get("/health")
+def health() -> Dict[str, Any]:
+    return {
+        "ok": True,
+        "model_loaded": all(x is not None for x in (caption_model, caption_processor, vqa_model, vqa_processor)),
         "model_ready_at": MODEL_READY_AT,
         "uptime_s": time.time() - APP_START_TS,
     }
 
-@app.get("/health")
-def health() -> Dict[str, Any]:
+@app.get("/healthz")
+def healthz() -> Dict[str, Any]:
     return {"ok": True}
 
 # -----------------------------------------------------------------------------
