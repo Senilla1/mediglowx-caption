@@ -54,10 +54,9 @@ class AnalyzeRequest(BaseModel):
 class AnalyzeResponse(BaseModel):
     id: str
     answers: Dict[str, str]
-    led_modes: List[Dict[str, Any]] = Field(default_factory=list)
+    led_modes: List[str] = Field(default_factory=list)   # <- EZ
     rationale: str = ""
     model_ready_at: float = 0.0
-    # új mezők
     metrics: Dict[str, float] = Field(default_factory=dict)
     auto_flags: Dict[str, bool] = Field(default_factory=dict)
 
